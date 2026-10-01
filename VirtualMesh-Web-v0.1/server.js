@@ -189,6 +189,246 @@ mc.on('message', (topic, payload) => {
     'bytes'
   );
 
+  let result = null;
+
+  try {
+
+    const envelope = fromBinary(
+      Mqtt.ServiceEnvelopeSchema,
+      payload
+    );
+
+    console.log('SERVICE ENVELOPE: OK');
+    console.log(
+      'Gateway ID:',
+      envelope.gatewayId || '(none)'
+    );
+    console.log(
+      'Channel ID:',
+      envelope.channelId || '(none)'
+    );
+
+    const packet = envelope.packet;
+
+    if (!packet) {
+
+      console.log('MESH PACKET: MISSING');
+
+    } else {
+
+      console.log('MESH PACKET: OK');
+
+      // Convertimos IDs numéricos a formato Meshtastic !xxxxxxxx
+      const fromHex =
+        '!' +
+        Number(packet.from)
+          .toString(16)
+          .padStart(8, '0');
+
+      const toHex =
+        '!' +
+        Number(packet.to)
+          .toString(16)
+          .padStart(8, '0');
+
+      const isBroadcast =
+        Number(packet.to) === 0xffffffff;
+
+      console.log(
+        'From:',
+        packet.from,
+        `(${fromHex})`
+      );
+
+      console.log(
+        'To:',
+        packet.to,
+        isBroadcast
+          ? '(BROADCAST)'
+          : `(${toHex})`
+      );
+
+      console.log(
+        'Packet ID:',
+        packet.id
+      );
+
+      console.log(
+        'Channel:',
+        packet.channel
+      );
+
+      console.log(
+        'Hop Limit:',
+        packet.hopLimit
+      );
+
+      console.log(
+        'Hop Start:',
+        packet.hopStart
+      );
+
+      // --------------------------------
+      // PAYLOAD TYPE
+      // --------------------------------
+
+      const hasEncrypted =
+        packet.encrypted &&
+        packet.encrypted.length > 0;
+
+      const hasDecoded =
+        packet.decoded != null;
+
+      let payloadType = 'UNKNOWN';
+      let portnum = null;
+      let decodedBytes = 0;
+
+      if (hasDecoded) {
+
+        payloadType = 'DECODED';
+
+        portnum =
+          packet.decoded.portnum;
+
+        decodedBytes =
+          packet.decoded.payload
+            ? packet.decoded.payload.length
+            : 0;
+
+        console.log('Payload: DECODED');
+
+        console.log(
+          'PortNum:',
+          portnum
+        );
+
+        console.log(
+          'Decoded payload bytes:',
+          decodedBytes
+        );
+
+        console.log(
+          'Want response:',
+          packet.decoded.wantResponse
+        );
+
+        console.log(
+          'Request ID:',
+          packet.decoded.requestId
+        );
+
+        console.log(
+          'Reply ID:',
+          packet.decoded.replyId
+        );
+
+      } else if (hasEncrypted) {
+
+        payloadType = 'ENCRYPTED';
+
+        console.log('Payload: ENCRYPTED');
+
+        console.log(
+          'Encrypted bytes:',
+          packet.encrypted.length
+        );
+
+      } else {
+
+        console.log(
+          'Payload: NONE / UNKNOWN'
+        );
+
+      }
+
+      // --------------------------------
+      // STRUCTURED RESULT FOR WEB APP
+      // --------------------------------
+
+      result = {
+
+        serviceEnvelope: true,
+
+        gatewayId:
+          envelope.gatewayId || null,
+
+        channelId:
+          envelope.channelId || null,
+
+        from:
+          packet.from,
+
+        fromHex,
+
+        to:
+          packet.to,
+
+        toHex:
+          isBroadcast
+            ? null
+            : toHex,
+
+        broadcast:
+          isBroadcast,
+
+        id:
+          packet.id,
+
+        channel:
+          packet.channel,
+
+        hopLimit:
+          packet.hopLimit,
+
+        hopStart:
+          packet.hopStart,
+
+        payloadType,
+
+        portnum,
+
+        decodedBytes,
+
+        encryptedBytes:
+          hasEncrypted
+            ? packet.encrypted.length
+            : 0
+
+      };
+
+    }
+
+  } catch (err) {
+
+    console.error(
+      'SERVICE ENVELOPE DECODE ERROR:',
+      err.message
+    );
+
+  }
+
+  broadcast({
+
+    type: 'packet',
+
+    topic,
+
+    receivedAt:
+      new Date().toISOString(),
+
+    bytes:
+      payload.length,
+
+    base64:
+      payload.toString('base64'),
+
+    decoded:
+      result
+
+  });
+
+});
+
   let decoded = null;
 
   try {
