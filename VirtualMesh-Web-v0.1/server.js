@@ -3,6 +3,7 @@ import http from 'http';
 import { WebSocketServer } from 'ws';
 import mqtt from 'mqtt';
 import crypto from 'crypto';
+import { fromBinary } from '@bufbuild/protobuf';
 import { Mqtt } from '@meshtastic/protobufs';
 
 const PORT = process.env.PORT || 8080;
