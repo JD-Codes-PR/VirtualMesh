@@ -16,10 +16,37 @@ function broadcast(o){const s=JSON.stringify(o); for(const ws of clients) if(ws.
 const opts={protocolVersion:4,reconnectPeriod:5000,connectTimeout:15000,clean:true};
 if(MQTT_USER) opts.username=MQTT_USER; if(MQTT_PASS) opts.password=MQTT_PASS;
 const mc=mqtt.connect(MQTT_URL,opts);
-mc.on('connect',()=>{mqttState='connected';lastError='';mc.subscribe(TOPIC,{qos:0},e=>{if(e){lastError=e.message;broadcast({type:'status',mqttState,lastError,topic:TOPIC})}});broadcast({type:'status',mqttState,lastError,topic:TOPIC})});
-mc.on('reconnect',()=>{mqttState='reconnecting';broadcast({type:'status',mqttState,lastError,topic:TOPIC})});
-mc.on('offline',()=>{mqttState='offline';broadcast({type:'status',mqttState,lastError,topic:TOPIC})});
-mc.on('error',e=>{lastError=e.message;broadcast({type:'status',mqttState,lastError,topic:TOPIC})});
+mc.on('connect',()=>{
+  console.log('MQTT CONNECTED:', MQTT_URL);
+  mqttState='connected';
+  lastError='';
+  mc.subscribe(TOPIC,{qos:0},e=>{
+    if(e){
+      lastError=e.message;
+      console.error('MQTT SUBSCRIBE ERROR:',e.message);
+      broadcast({type:'status',mqttState,lastError,topic:TOPIC});
+    }
+  });
+  broadcast({type:'status',mqttState,lastError,topic:TOPIC});
+});
+
+mc.on('reconnect',()=>{
+  console.log('MQTT RECONNECTING');
+  mqttState='reconnecting';
+  broadcast({type:'status',mqttState,lastError,topic:TOPIC});
+});
+
+mc.on('offline',()=>{
+  console.log('MQTT OFFLINE');
+  mqttState='offline';
+  broadcast({type:'status',mqttState,lastError,topic:TOPIC});
+});
+
+mc.on('error',e=>{
+  console.error('MQTT ERROR:',e.message);
+  lastError=e.message;
+  broadcast({type:'status',mqttState,lastError,topic:TOPIC});
+});
 mc.on('message',(topic,payload)=>broadcast({type:'packet',topic,receivedAt:new Date().toISOString(),bytes:payload.length,base64:payload.toString('base64')}));
 wss.on('connection',ws=>{clients.add(ws);ws.send(JSON.stringify({type:'status',mqttState,lastError,topic:TOPIC,mode:'READ_ONLY'}));ws.on('close',()=>clients.delete(ws));});
 server.listen(PORT,()=>console.log(`VirtualMesh Web listening on ${PORT}; MQTT read-only topic ${TOPIC}`));
