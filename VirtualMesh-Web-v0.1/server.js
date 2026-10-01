@@ -196,8 +196,10 @@ mc.on('message', (topic, payload) => {
     // Meshtastic MQTT binary payload
     // -> protobuf ServiceEnvelope
 
-    const envelope =
-      Mqtt.ServiceEnvelope.fromBinary(payload);
+    const envelope = fromBinary(
+  Mqtt.ServiceEnvelopeSchema,
+  payload
+);
 
     console.log(
       'SERVICE ENVELOPE: OK'
