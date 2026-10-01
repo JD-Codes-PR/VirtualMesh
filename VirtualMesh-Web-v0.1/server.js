@@ -3,7 +3,7 @@ import http from 'http';
 import { WebSocketServer } from 'ws';
 import mqtt from 'mqtt';
 import crypto from 'crypto';
-import { ServiceEnvelope } from '@meshtastic/protobufs';
+import { Mqtt } from '@meshtastic/protobufs';
 
 const PORT = process.env.PORT || 8080;
 
@@ -21,7 +21,7 @@ const TOPIC =
   process.env.MQTT_TOPIC ||
   'msh/US/PR/2/e/LongFast/+';
 
-// Identificador MQTT anónimo y único para esta instancia.
+// ID anónimo para esta instancia de VirtualMesh
 const CLIENT_ID =
   'virtualmesh-' + crypto.randomBytes(6).toString('hex');
 
@@ -42,22 +42,36 @@ let lastError = '';
 const clients = new Set();
 
 function broadcast(data) {
+
   const message = JSON.stringify(data);
 
   for (const ws of clients) {
+
     if (ws.readyState === 1) {
       ws.send(message);
     }
+
   }
 }
 
+// ======================================================
+// MQTT CONFIGURATION
+// ======================================================
+
 const opts = {
+
   protocolVersion: 4, // MQTT 3.1.1
+
   clientId: CLIENT_ID,
+
   reconnectPeriod: 5000,
+
   connectTimeout: 15000,
+
   keepalive: 60,
+
   clean: true
+
 };
 
 if (MQTT_USER) {
@@ -68,27 +82,43 @@ if (MQTT_PASS) {
   opts.password = MQTT_PASS;
 }
 
-console.log('-----------------------------------');
-console.log('VirtualMesh MQTT diagnostics');
+console.log('===================================');
+console.log('VirtualMesh');
+console.log('Meshtastic MQTT Receiver');
+console.log('===================================');
 console.log('Broker:', MQTT_URL);
 console.log('Client ID:', CLIENT_ID);
 console.log('Topic:', TOPIC);
 console.log('Mode: READ ONLY');
 console.log('MQTT protocol: 3.1.1');
-console.log('-----------------------------------');
+console.log('===================================');
 
-const mc = mqtt.connect(MQTT_URL, opts);
+const mc = mqtt.connect(
+  MQTT_URL,
+  opts
+);
 
-// MQTT CONNECT / CONNACK
+// ======================================================
+// MQTT CONNECT
+// ======================================================
+
 mc.on('connect', (connack) => {
 
+  console.log('');
   console.log('MQTT CONNECTED');
-  console.log('CONNACK:', JSON.stringify(connack));
+
+  console.log(
+    'CONNACK:',
+    JSON.stringify(connack)
+  );
 
   mqttState = 'connected';
   lastError = '';
 
-  console.log('SUBSCRIBE ->', TOPIC);
+  console.log(
+    'SUBSCRIBE ->',
+    TOPIC
+  );
 
   mc.subscribe(
     TOPIC,
@@ -114,29 +144,43 @@ mc.on('connect', (connack) => {
       }
 
       broadcast({
+
         type: 'status',
+
         mqttState,
+
         lastError,
+
         topic: TOPIC
+
       });
+
     }
   );
 
   broadcast({
+
     type: 'status',
+
     mqttState,
+
     lastError,
+
     topic: TOPIC
+
   });
+
 });
 
 // ======================================================
-// MESHTASTIC MQTT PACKET -> SERVICE ENVELOPE DECODER
+// MESHTASTIC SERVICE ENVELOPE DECODER
 // ======================================================
 
 mc.on('message', (topic, payload) => {
 
+  console.log('');
   console.log('-----------------------------------');
+
   console.log(
     'MQTT PACKET:',
     topic,
@@ -148,42 +192,92 @@ mc.on('message', (topic, payload) => {
 
   try {
 
-    // MQTT Meshtastic payload = protobuf ServiceEnvelope
+    // Meshtastic MQTT binary payload
+    // -> protobuf ServiceEnvelope
+
     const envelope =
-      ServiceEnvelope.fromBinary(payload);
+      Mqtt.ServiceEnvelope.fromBinary(payload);
 
-    const packet = envelope.packet;
+    console.log(
+      'SERVICE ENVELOPE: OK'
+    );
 
-    console.log('SERVICE ENVELOPE: OK');
     console.log(
       'Gateway ID:',
       envelope.gatewayId || '(none)'
     );
+
     console.log(
       'Channel ID:',
       envelope.channelId || '(none)'
     );
 
+    const packet =
+      envelope.packet;
+
     if (packet) {
 
-      console.log('MESH PACKET: OK');
-      console.log('From:', packet.from);
-      console.log('To:', packet.to);
-      console.log('Packet ID:', packet.id);
-      console.log('Channel:', packet.channel);
+      console.log(
+        'MESH PACKET: OK'
+      );
+
+      console.log(
+        'From:',
+        packet.from
+      );
+
+      console.log(
+        'To:',
+        packet.to
+      );
+
+      console.log(
+        'Packet ID:',
+        packet.id
+      );
+
+      console.log(
+        'Channel:',
+        packet.channel
+      );
+
+      console.log(
+        'Hop Limit:',
+        packet.hopLimit
+      );
+
+      console.log(
+        'Hop Start:',
+        packet.hopStart
+      );
 
       const encrypted =
         packet.encrypted &&
         packet.encrypted.length > 0;
 
-      console.log(
-        'Payload:',
-        encrypted
-          ? `ENCRYPTED (${packet.encrypted.length} bytes)`
-          : 'NOT ENCRYPTED'
-      );
+      if (encrypted) {
+
+        console.log(
+          'Payload: ENCRYPTED'
+        );
+
+        console.log(
+          'Encrypted bytes:',
+          packet.encrypted.length
+        );
+
+      } else {
+
+        console.log(
+          'Payload: NOT ENCRYPTED'
+        );
+
+      }
 
       decoded = {
+
+        serviceEnvelope: true,
+
         gatewayId:
           envelope.gatewayId || null,
 
@@ -202,6 +296,12 @@ mc.on('message', (topic, payload) => {
         channel:
           packet.channel,
 
+        hopLimit:
+          packet.hopLimit,
+
+        hopStart:
+          packet.hopStart,
+
         encrypted:
           Boolean(encrypted),
 
@@ -209,11 +309,14 @@ mc.on('message', (topic, payload) => {
           encrypted
             ? packet.encrypted.length
             : 0
+
       };
 
     } else {
 
-      console.log('MESH PACKET: MISSING');
+      console.log(
+        'MESH PACKET: MISSING'
+      );
 
     }
 
@@ -226,11 +329,13 @@ mc.on('message', (topic, payload) => {
 
   }
 
-  // Enviar paquete al navegador.
-  // Seguimos únicamente recibiendo.
+  // Enviar resultado al navegador
   broadcast({
+
     type: 'packet',
+
     topic,
+
     receivedAt:
       new Date().toISOString(),
 
@@ -241,58 +346,85 @@ mc.on('message', (topic, payload) => {
       payload.toString('base64'),
 
     decoded
+
   });
 
 });
 
 // ======================================================
+// MQTT DIAGNOSTICS
+// ======================================================
 
 mc.on('reconnect', () => {
 
-  console.log('MQTT RECONNECTING');
+  console.log(
+    'MQTT RECONNECTING'
+  );
 
-  mqttState = 'reconnecting';
+  mqttState =
+    'reconnecting';
 
   broadcast({
+
     type: 'status',
+
     mqttState,
+
     lastError,
+
     topic: TOPIC
+
   });
+
 });
 
 mc.on('offline', () => {
 
-  console.log('MQTT OFFLINE');
+  console.log(
+    'MQTT OFFLINE'
+  );
 
-  mqttState = 'offline';
+  mqttState =
+    'offline';
 
   broadcast({
+
     type: 'status',
+
     mqttState,
+
     lastError,
+
     topic: TOPIC
+
   });
+
 });
 
 mc.on('close', () => {
 
-  console.log('MQTT CONNECTION CLOSED');
-
-});
-
-mc.on('disconnect', (packet) => {
-
   console.log(
-    'MQTT DISCONNECT:',
-    JSON.stringify(packet)
+    'MQTT CONNECTION CLOSED'
   );
 
 });
 
+mc.on(
+  'disconnect',
+  (packet) => {
+
+    console.log(
+      'MQTT DISCONNECT:',
+      JSON.stringify(packet)
+    );
+
+  }
+);
+
 mc.on('error', (err) => {
 
-  lastError = err.message;
+  lastError =
+    err.message;
 
   console.error(
     'MQTT ERROR:',
@@ -300,37 +432,68 @@ mc.on('error', (err) => {
   );
 
   broadcast({
+
     type: 'status',
+
     mqttState,
+
     lastError,
+
     topic: TOPIC
+
   });
-});
-
-// Browser -> VirtualMesh WebSocket bridge
-wss.on('connection', (ws) => {
-
-  clients.add(ws);
-
-  ws.send(
-    JSON.stringify({
-      type: 'status',
-      mqttState,
-      lastError,
-      topic: TOPIC,
-      mode: 'READ_ONLY'
-    })
-  );
-
-  ws.on('close', () => {
-    clients.delete(ws);
-  });
-});
-
-server.listen(PORT, () => {
-
-  console.log(
-    `VirtualMesh Web listening on ${PORT}; MQTT read-only topic ${TOPIC}`
-  );
 
 });
+
+// ======================================================
+// WEB BROWSER <-> VIRTUALMESH
+// ======================================================
+
+wss.on(
+  'connection',
+  (ws) => {
+
+    clients.add(ws);
+
+    ws.send(
+      JSON.stringify({
+
+        type: 'status',
+
+        mqttState,
+
+        lastError,
+
+        topic: TOPIC,
+
+        mode: 'READ_ONLY'
+
+      })
+    );
+
+    ws.on(
+      'close',
+      () => {
+
+        clients.delete(ws);
+
+      }
+    );
+
+  }
+);
+
+// ======================================================
+// START SERVER
+// ======================================================
+
+server.listen(
+  PORT,
+  () => {
+
+    console.log(
+      `VirtualMesh Web listening on ${PORT}; MQTT read-only topic ${TOPIC}`
+    );
+
+  }
+);
