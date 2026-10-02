@@ -141,6 +141,17 @@ let pktInteresting = false;
 let suppressedPackets = 0;
 let totalPackets = 0;
 const seenUnhandledPorts = new Set();
+let lastSummaryTotal = 0;
+
+// Where do the packets go? (decoded / encrypted / no payload / no packet)
+const variantStats = {
+  decoded: 0,
+  encrypted: 0,
+  noPayload: 0,
+  noPacket: 0,
+  retained: 0,
+  portnum0Rejected: 0
+};
 
 function plog(...args) {
   if (pktLog) {
@@ -1066,6 +1077,13 @@ function handleMessage(topic, payload) {
 
       plog('MESH PACKET: MISSING');
 
+      variantStats.noPacket++;
+
+      if (variantStats.noPacket <= 5) {
+        pktInteresting = true;
+        plog('SAMPLE NO-PACKET RAW HEX:', Buffer.from(payload).toString('hex'));
+      }
+
       result = {
         serviceEnvelope: true,
         meshPacket: false,
@@ -1143,6 +1161,8 @@ function handleMessage(topic, payload) {
 
         payloadType = 'DECODED';
 
+        variantStats.decoded++;
+
         const data = variant.value;
 
         portnum = data.portnum;
@@ -1196,6 +1216,8 @@ function handleMessage(topic, payload) {
 
         payloadType = 'ENCRYPTED';
 
+        variantStats.encrypted++;
+
         encryptedBytes = variant.value?.length || 0;
 
         decryptionAttempted = true;
@@ -1225,6 +1247,13 @@ function handleMessage(topic, payload) {
 
           const data =
             fromBinary(Mesh.DataSchema, plaintext);
+
+          // Random bytes can parse as a Data protobuf with portnum 0
+          // (UNKNOWN_APP). That is NOT a valid decryption.
+          if (data.portnum === 0) {
+            variantStats.portnum0Rejected++;
+            throw new Error('portnum 0 (UNKNOWN_APP): not a valid decrypt');
+          }
 
           decryptionSuccess = true;
 
@@ -1290,6 +1319,14 @@ function handleMessage(topic, payload) {
       else {
 
         plog('Payload: NONE / UNKNOWN');
+
+        variantStats.noPayload++;
+
+        if (variantStats.noPayload <= 5) {
+          pktInteresting = true;
+          plog('SAMPLE NO-PAYLOAD RAW HEX:', Buffer.from(payload).toString('hex'));
+          plog('SAMPLE NO-PAYLOAD TOPIC:', topic);
+        }
         plog(
           'payloadVariant case:',
           variant?.case || '(none)'
@@ -1576,7 +1613,11 @@ function handleMessage(topic, payload) {
   });
 }
 
-mc.on('message', (topic, payload) => {
+mc.on('message', (topic, payload, mqttPacket) => {
+
+  if (mqttPacket?.retain) {
+    variantStats.retained++;
+  }
 
   pktLog = [];
   pktInteresting = false;
@@ -1606,6 +1647,9 @@ setInterval(() => {
   console.log('');
   console.log('========== SUMMARY (60s) ==========');
   console.log('Total packets:', totalPackets);
+  console.log('New in last 60s:', totalPackets - lastSummaryTotal);
+  lastSummaryTotal = totalPackets;
+  console.log('Variants:', JSON.stringify(variantStats));
   console.log('Suppressed from log:', suppressedPackets);
   console.log('Observed nodes:', observedNodes.size);
   console.log('Nodes by region:', JSON.stringify(getNodeCountsByRegion()));
