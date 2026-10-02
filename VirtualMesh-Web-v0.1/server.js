@@ -85,6 +85,26 @@ let lastError = '';
 
 const observedNodes = new Map();
 
+// Global node identity (deduplicated across MQTT roots/regions).
+// Keyed only by Meshtastic node id, e.g. !16c508c0.
+const uniqueNodes = new Map();
+
+// Normalized message inbox. One Meshtastic message can be observed by
+// several gateways and through both protobuf and JSON MQTT transports.
+const messageInbox = new Map();
+const MESSAGE_INBOX_MAX = 500;
+
+const messageDedupStats = {
+  observations: 0,
+  unique: 0,
+  duplicates: 0,
+  protobuf: 0,
+  json: 0,
+  pkiJson: 0,
+  directed: 0,
+  broadcast: 0
+};
+
 // ======================================================
 // STATISTICS
 // ======================================================
@@ -528,6 +548,94 @@ function addDecryptAttempt(channelId, success) {
 }
 
 // ======================================================
+// NORMALIZED MESSAGE INBOX / DEDUPLICATION
+// ======================================================
+
+function normalizeNodeNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? (n >>> 0) : 0;
+}
+
+function messageIdentity(from, packetId, text, to) {
+  const f = normalizeNodeNumber(from);
+  const id = normalizeNodeNumber(packetId);
+  if (f && id) return `${f}:${id}`;
+  // Fallback for transports that do not expose a packet id.
+  return crypto.createHash('sha256')
+    .update(`${f}|${normalizeNodeNumber(to)}|${String(text || '')}`)
+    .digest('hex');
+}
+
+function recordMessageObservation({
+  regionId, transport, topic, channelId, from, to, packetId,
+  text, gatewayId, directed, pki = false, receivedAt = new Date().toISOString()
+}) {
+  if (typeof text !== 'string' || !text.length) return null;
+
+  messageDedupStats.observations++;
+  if (transport === 'protobuf') messageDedupStats.protobuf++;
+  if (transport === 'json') messageDedupStats.json++;
+  if (pki && transport === 'json') messageDedupStats.pkiJson++;
+
+  const key = messageIdentity(from, packetId, text, to);
+  const existing = messageInbox.get(key);
+  const gateway = gatewayId || null;
+
+  if (existing) {
+    messageDedupStats.duplicates++;
+    existing.lastSeen = receivedAt;
+    existing.mqttCopies++;
+    if (gateway && !existing.gateways.includes(gateway)) existing.gateways.push(gateway);
+    if (regionId && !existing.regionsSeen.includes(regionId)) existing.regionsSeen.push(regionId);
+    if (transport && !existing.transports.includes(transport)) existing.transports.push(transport);
+    if (topic && !existing.topics.includes(topic) && existing.topics.length < 12) existing.topics.push(topic);
+    existing.pki = existing.pki || pki;
+    return { isNew: false, message: existing };
+  }
+
+  const isDirected = directed ?? (normalizeNodeNumber(to) !== 0xffffffff);
+  const item = {
+    key,
+    packetId: normalizeNodeNumber(packetId),
+    from: normalizeNodeNumber(from),
+    fromHex: nodeIdToHex(from),
+    to: normalizeNodeNumber(to),
+    toHex: normalizeNodeNumber(to) === 0xffffffff ? 'BROADCAST' : nodeIdToHex(to),
+    directed: !!isDirected,
+    broadcast: !isDirected,
+    pki: !!pki,
+    channelId: channelId || null,
+    text,
+    firstSeen: receivedAt,
+    lastSeen: receivedAt,
+    mqttCopies: 1,
+    gateways: gateway ? [gateway] : [],
+    regionsSeen: regionId ? [regionId] : [],
+    transports: transport ? [transport] : [],
+    topics: topic ? [topic] : []
+  };
+
+  messageInbox.set(key, item);
+  messageDedupStats.unique++;
+  if (item.directed) messageDedupStats.directed++;
+  else messageDedupStats.broadcast++;
+
+  while (messageInbox.size > MESSAGE_INBOX_MAX) {
+    const oldest = messageInbox.keys().next().value;
+    messageInbox.delete(oldest);
+  }
+
+  broadcast({ type: 'message', message: item, messageDedupStats: { ...messageDedupStats } });
+  return { isNew: true, message: item };
+}
+
+function getMessagesNewestFirst() {
+  return Array.from(messageInbox.values()).sort((a, b) =>
+    String(b.lastSeen).localeCompare(String(a.lastSeen))
+  );
+}
+
+// ======================================================
 // OBSERVED NODE
 // ======================================================
 
@@ -554,6 +662,28 @@ function updateObservedNode(regionId, nodeId, changes) {
   };
 
   observedNodes.set(key, updated);
+
+  // Maintain a second, global identity table so the same node observed
+  // under US, FL, TX, PR, etc. is not counted as several nodes.
+  const globalExisting = uniqueNodes.get(nodeHex) || {
+    nodeId: Number(nodeId),
+    nodeHex,
+    firstSeen: updated.firstSeen,
+    regionsSeen: []
+  };
+  const regionsSeen = Array.isArray(globalExisting.regionsSeen)
+    ? [...globalExisting.regionsSeen]
+    : [];
+  if (!regionsSeen.includes(regionId)) regionsSeen.push(regionId);
+  uniqueNodes.set(nodeHex, {
+    ...globalExisting,
+    ...changes,
+    nodeId: Number(nodeId),
+    nodeHex,
+    regionsSeen,
+    lastRegion: regionId,
+    lastSeen: updated.lastSeen
+  });
 
   return updated;
 }
@@ -988,6 +1118,33 @@ function inspectJsonPacket(region, topic, payload) {
 
       jsonStats.possibleText++;
       pktInteresting = true;
+
+      const jsonText =
+        typeof obj?.payload?.text === 'string' ? obj.payload.text :
+        typeof obj?.text === 'string' ? obj.text : null;
+      const topicParts = String(topic).split('/');
+      const jsonChannel = topicParts.length >= 5 ? topicParts[4] : null;
+      const jsonGateway = obj.sender || (topicParts.length >= 6 ? topicParts[5] : null);
+      const isPkiJson = String(jsonChannel || '').toUpperCase() === 'PKI';
+      const jsonDirected = normalizeNodeNumber(obj.to) !== 0xffffffff;
+
+      if (jsonText) {
+        const recorded = recordMessageObservation({
+          regionId: region.id,
+          transport: 'json',
+          topic,
+          channelId: jsonChannel,
+          from: obj.from,
+          to: obj.to,
+          packetId: obj.id,
+          text: jsonText,
+          gatewayId: jsonGateway,
+          directed: jsonDirected,
+          pki: isPkiJson
+        });
+        plog('Normalized message:', recorded?.isNew ? 'NEW' : 'DUPLICATE');
+        plog('Message class:', isPkiJson ? 'PKI JSON MESSAGE' : (jsonDirected ? 'DIRECTED JSON MESSAGE' : 'PUBLIC JSON MESSAGE'));
+      }
 
       plog('===================================');
       plog('POSSIBLE JSON TEXT MESSAGE');
@@ -1539,9 +1696,23 @@ function handleMessage(topic, payload) {
 
         addRegionMessage(region.id);
 
+        const normalizedMessage = recordMessageObservation({
+          regionId: region.id,
+          transport: 'protobuf',
+          topic,
+          channelId: envelope.channelId || null,
+          from: packet.from,
+          to: packet.to,
+          packetId: packet.id,
+          text: application.text,
+          gatewayId: envelope.gatewayId || null,
+          directed: !isBroadcast,
+          pki: String(envelope.channelId || '').toUpperCase() === 'PKI'
+        });
+
         plog('');
         plog('===================================');
-        plog('TEXT MESSAGE RECEIVED');
+        plog(normalizedMessage?.isNew ? 'TEXT MESSAGE RECEIVED' : 'DUPLICATE TEXT MESSAGE');
         plog('===================================');
         plog('Region:', region.id);
         plog('Channel ID:', envelope.channelId || '(none)');
@@ -1946,6 +2117,9 @@ wss.on('connection', ws => {
       mode: 'READ_ONLY',
       trafficMode: 'DIAGNOSTIC_TRY_ALL',
       observedNodeCount: observedNodes.size,
+      uniqueNodeCount: uniqueNodes.size,
+      messageCount: messageInbox.size,
+      messageDedupStats: { ...messageDedupStats },
       nodeCounts: getNodeCountsByRegion(),
       regionStats: getRegionStatsObject(),
       portStats: getPortStatsObject(),
@@ -1961,6 +2135,8 @@ wss.on('connection', ws => {
     JSON.stringify({
       type: 'nodes',
       nodes: Array.from(observedNodes.values()),
+      uniqueNodes: Array.from(uniqueNodes.values()),
+      uniqueNodeCount: uniqueNodes.size,
       nodeCounts: getNodeCountsByRegion()
     })
   );
@@ -1987,14 +2163,63 @@ app.get('/api/nodes', (req, res) => {
     );
   }
 
+  let globalNodes = Array.from(uniqueNodes.values());
+  if (requestedRegion) {
+    globalNodes = globalNodes.filter(node =>
+      Array.isArray(node.regionsSeen) && node.regionsSeen.includes(requestedRegion)
+    );
+  }
+
   res.json({
     mode: 'READ_ONLY',
     trafficMode: 'DIAGNOSTIC_TRY_ALL',
     count: nodes.length,
     totalCount: observedNodes.size,
+    uniqueCount: globalNodes.length,
+    totalUniqueCount: uniqueNodes.size,
+    uniqueNodes: globalNodes,
     nodeCounts: getNodeCountsByRegion(),
     publicKeyNodeCounts: getPublicKeyNodeCounts(),
     regionStats: getRegionStatsObject(),
+    nodes
+  });
+});
+
+// ======================================================
+// API - NORMALIZED MESSAGES / UNIQUE NODES
+// ======================================================
+
+app.get('/api/messages', (req, res) => {
+  const directed = String(req.query.directed || '').toLowerCase();
+  const pki = String(req.query.pki || '').toLowerCase();
+  let messages = getMessagesNewestFirst();
+  if (directed === 'true') messages = messages.filter(m => m.directed);
+  if (directed === 'false') messages = messages.filter(m => !m.directed);
+  if (pki === 'true') messages = messages.filter(m => m.pki);
+  if (pki === 'false') messages = messages.filter(m => !m.pki);
+  res.json({
+    service: 'VirtualMesh',
+    mode: 'READ_ONLY',
+    count: messages.length,
+    maxStored: MESSAGE_INBOX_MAX,
+    stats: { ...messageDedupStats },
+    messages
+  });
+});
+
+app.get('/api/unique-nodes', (req, res) => {
+  const requestedRegion = String(req.query.region || '').toUpperCase();
+  let nodes = Array.from(uniqueNodes.values());
+  if (requestedRegion) {
+    nodes = nodes.filter(node =>
+      Array.isArray(node.regionsSeen) && node.regionsSeen.includes(requestedRegion)
+    );
+  }
+  res.json({
+    service: 'VirtualMesh',
+    mode: 'READ_ONLY',
+    count: nodes.length,
+    totalUniqueCount: uniqueNodes.size,
     nodes
   });
 });
@@ -2034,6 +2259,9 @@ app.get('/api/diagnostics', (req, res) => {
     mode: 'READ_ONLY',
     trafficMode: 'DIAGNOSTIC_TRY_ALL',
     observedNodes: observedNodes.size,
+    uniqueNodes: uniqueNodes.size,
+    messages: messageInbox.size,
+    messageDedupStats: { ...messageDedupStats },
     nodeCounts: getNodeCountsByRegion(),
     publicKeyNodeCounts: getPublicKeyNodeCounts(),
     portStats: getPortStatsObject(),
@@ -2089,6 +2317,9 @@ app.get('/api/status', (req, res) => {
     mode: 'READ_ONLY',
     trafficMode: 'DIAGNOSTIC_TRY_ALL',
     observedNodes: observedNodes.size,
+    uniqueNodes: uniqueNodes.size,
+    messages: messageInbox.size,
+    messageDedupStats: { ...messageDedupStats },
     nodeCounts: getNodeCountsByRegion(),
     publicKeyNodeCounts: getPublicKeyNodeCounts(),
     regionStats: getRegionStatsObject(),
@@ -2146,4 +2377,6 @@ server.listen(PORT, () => {
   console.log('MQTT publish: DISABLED');
   console.log('Diagnostics endpoint: /api/diagnostics');
   console.log('Traffic analyzer endpoint: /api/traffic-analyzer');
+  console.log('Normalized message inbox: /api/messages');
+  console.log('Global unique nodes: /api/unique-nodes');
 });
