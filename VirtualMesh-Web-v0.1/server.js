@@ -4,7 +4,12 @@ import { WebSocketServer } from 'ws';
 import mqtt from 'mqtt';
 import crypto from 'crypto';
 import { fromBinary } from '@bufbuild/protobuf';
-import { Mqtt, Mesh, Portnums } from '@meshtastic/protobufs';
+import {
+  Mqtt,
+  Mesh,
+  Portnums,
+  Telemetry
+} from '@meshtastic/protobufs';
 
 // ======================================================
 // VIRTUALMESH CONFIGURATION
@@ -65,13 +70,13 @@ const clients = new Set();
 
 // ======================================================
 // OBSERVED NODES DATABASE
-// Memory only - no persistence yet
+// Memory only
 // ======================================================
 
 const observedNodes = new Map();
 
 // ======================================================
-// BROADCAST TO BROWSER
+// BROADCAST
 // ======================================================
 
 function broadcast(data) {
@@ -90,7 +95,7 @@ function broadcast(data) {
 }
 
 // ======================================================
-// NODE ID -> !xxxxxxxx
+// NODE ID
 // ======================================================
 
 function nodeIdToHex(nodeId) {
@@ -170,7 +175,7 @@ function updateObservedNode(
 }
 
 // ======================================================
-// LONGFAST AES-128-CTR DECRYPTION
+// LONGFAST AES-128-CTR
 // ======================================================
 
 function decryptLongFast(
@@ -310,7 +315,7 @@ function decodePosition(payload) {
 }
 
 // ======================================================
-// NODEINFO / USER DECODER
+// NODEINFO DECODER
 // ======================================================
 
 function decodeNodeInfo(payload) {
@@ -354,6 +359,289 @@ function decodeNodeInfo(payload) {
 }
 
 // ======================================================
+// TELEMETRY DECODER
+// ======================================================
+
+function decodeTelemetry(payload) {
+
+  const telemetry =
+    fromBinary(
+      Telemetry.TelemetrySchema,
+      payload
+    );
+
+  const variant =
+    telemetry.variant;
+
+  const result = {
+
+    type:
+      'telemetry',
+
+    time:
+      telemetry.time || null,
+
+    telemetryType:
+      variant?.case || 'unknown',
+
+    metrics:
+      null
+
+  };
+
+  if (!variant?.case) {
+    return result;
+  }
+
+  const value =
+    variant.value;
+
+  // --------------------------------------------------
+  // DEVICE METRICS
+  // --------------------------------------------------
+
+  if (
+    variant.case ===
+    'deviceMetrics'
+  ) {
+
+    result.metrics = {
+
+      batteryLevel:
+        value.batteryLevel ?? null,
+
+      voltage:
+        value.voltage ?? null,
+
+      channelUtilization:
+        value.channelUtilization ?? null,
+
+      airUtilTx:
+        value.airUtilTx ?? null,
+
+      uptimeSeconds:
+        value.uptimeSeconds ?? null
+
+    };
+
+  }
+
+  // --------------------------------------------------
+  // ENVIRONMENT METRICS
+  // --------------------------------------------------
+
+  else if (
+    variant.case ===
+    'environmentMetrics'
+  ) {
+
+    result.metrics = {
+
+      temperature:
+        value.temperature ?? null,
+
+      relativeHumidity:
+        value.relativeHumidity ?? null,
+
+      barometricPressure:
+        value.barometricPressure ?? null,
+
+      gasResistance:
+        value.gasResistance ?? null,
+
+      voltage:
+        value.voltage ?? null,
+
+      current:
+        value.current ?? null,
+
+      iaq:
+        value.iaq ?? null,
+
+      distance:
+        value.distance ?? null,
+
+      lux:
+        value.lux ?? null,
+
+      whiteLux:
+        value.whiteLux ?? null,
+
+      irLux:
+        value.irLux ?? null,
+
+      uvLux:
+        value.uvLux ?? null,
+
+      windDirection:
+        value.windDirection ?? null,
+
+      windSpeed:
+        value.windSpeed ?? null,
+
+      windGust:
+        value.windGust ?? null,
+
+      windLull:
+        value.windLull ?? null,
+
+      weight:
+        value.weight ?? null,
+
+      radiation:
+        value.radiation ?? null,
+
+      rainfall1h:
+        value.rainfall1h ?? null,
+
+      rainfall24h:
+        value.rainfall24h ?? null,
+
+      soilMoisture:
+        value.soilMoisture ?? null,
+
+      soilTemperature:
+        value.soilTemperature ?? null
+
+    };
+
+  }
+
+  // --------------------------------------------------
+  // POWER METRICS
+  // --------------------------------------------------
+
+  else if (
+    variant.case ===
+    'powerMetrics'
+  ) {
+
+    result.metrics = {
+
+      ch1Voltage:
+        value.ch1Voltage ?? null,
+
+      ch1Current:
+        value.ch1Current ?? null,
+
+      ch2Voltage:
+        value.ch2Voltage ?? null,
+
+      ch2Current:
+        value.ch2Current ?? null,
+
+      ch3Voltage:
+        value.ch3Voltage ?? null,
+
+      ch3Current:
+        value.ch3Current ?? null
+
+    };
+
+  }
+
+  // --------------------------------------------------
+  // AIR QUALITY
+  // --------------------------------------------------
+
+  else if (
+    variant.case ===
+    'airQualityMetrics'
+  ) {
+
+    result.metrics = {
+
+      pm10Standard:
+        value.pm10Standard ?? null,
+
+      pm25Standard:
+        value.pm25Standard ?? null,
+
+      pm100Standard:
+        value.pm100Standard ?? null,
+
+      pm10Environmental:
+        value.pm10Environmental ?? null,
+
+      pm25Environmental:
+        value.pm25Environmental ?? null,
+
+      pm100Environmental:
+        value.pm100Environmental ?? null,
+
+      co2:
+        value.co2 ?? null,
+
+      co2Temperature:
+        value.co2Temperature ?? null,
+
+      co2Humidity:
+        value.co2Humidity ?? null
+
+    };
+
+  }
+
+  // --------------------------------------------------
+  // LOCAL STATS
+  // --------------------------------------------------
+
+  else if (
+    variant.case ===
+    'localStats'
+  ) {
+
+    result.metrics = {
+
+      uptimeSeconds:
+        value.uptimeSeconds ?? null,
+
+      channelUtilization:
+        value.channelUtilization ?? null,
+
+      airUtilTx:
+        value.airUtilTx ?? null,
+
+      numPacketsTx:
+        value.numPacketsTx ?? null,
+
+      numPacketsRx:
+        value.numPacketsRx ?? null,
+
+      numPacketsRxBad:
+        value.numPacketsRxBad ?? null,
+
+      numOnlineNodes:
+        value.numOnlineNodes ?? null,
+
+      numTotalNodes:
+        value.numTotalNodes ?? null,
+
+      numRxDupe:
+        value.numRxDupe ?? null
+
+    };
+
+  }
+
+  // --------------------------------------------------
+  // OTHER TELEMETRY TYPES
+  // --------------------------------------------------
+
+  else {
+
+    result.metrics = {
+      detected:
+        true
+    };
+
+  }
+
+  return result;
+
+}
+
+// ======================================================
 // APPLICATION PAYLOAD DECODER
 // ======================================================
 
@@ -377,6 +665,7 @@ function decodeApplicationPayload(
 
     return {
       type: 'text',
+
       text:
         Buffer.from(payload)
           .toString('utf8')
@@ -401,7 +690,7 @@ function decodeApplicationPayload(
   }
 
   // --------------------------------------------------
-  // NODE INFO
+  // NODEINFO
   // --------------------------------------------------
 
   if (
@@ -416,10 +705,35 @@ function decodeApplicationPayload(
 
   }
 
+  // --------------------------------------------------
+  // TELEMETRY
+  // --------------------------------------------------
+
+  if (
+    portName ===
+    'TELEMETRY_APP'
+  ) {
+
+    return decodeTelemetry(
+      payload
+    );
+
+  }
+
+  // --------------------------------------------------
+  // UNKNOWN / NOT YET HANDLED
+  // --------------------------------------------------
+
   return {
-    type: 'unhandled',
+
+    type:
+      'unhandled',
+
+    portName,
+
     bytes:
       payload.length
+
   };
 
 }
@@ -465,7 +779,9 @@ console.log(
   '==================================='
 );
 
-console.log('VirtualMesh');
+console.log(
+  'VirtualMesh'
+);
 
 console.log(
   'Meshtastic MQTT Receiver'
@@ -507,6 +823,14 @@ console.log(
 );
 
 console.log(
+  'TELEMETRY_APP decoder: ENABLED'
+);
+
+console.log(
+  'TEXT_MESSAGE_APP decoder: ENABLED'
+);
+
+console.log(
   'MQTT protocol: 3.1.1'
 );
 
@@ -533,6 +857,7 @@ mc.on(
   (connack) => {
 
     console.log('');
+
     console.log(
       'MQTT CONNECTED'
     );
@@ -578,10 +903,17 @@ mc.on(
         }
 
         broadcast({
-          type: 'status',
+
+          type:
+            'status',
+
           mqttState,
+
           lastError,
-          topic: TOPIC
+
+          topic:
+            TOPIC
+
         });
 
       }
@@ -712,10 +1044,10 @@ mc.on(
         packet.hopStart
       );
 
-      // Record that node was seen
       updateObservedNode(
         packet.from,
         {
+
           lastGateway:
             envelope.gatewayId ||
             null,
@@ -723,6 +1055,7 @@ mc.on(
           channelId:
             envelope.channelId ||
             null
+
         }
       );
 
@@ -755,7 +1088,7 @@ mc.on(
         null;
 
       // ================================================
-      // ALREADY DECODED DATA
+      // ALREADY DECODED
       // ================================================
 
       if (
@@ -952,7 +1285,7 @@ mc.on(
       }
 
       // ================================================
-      // APPLICATION OUTPUT
+      // TEXT
       // ================================================
 
       if (
@@ -1062,6 +1395,116 @@ mc.on(
           packet.from,
           {
             user:
+              application
+          }
+        );
+
+      }
+
+      // ================================================
+      // TELEMETRY
+      // ================================================
+
+      if (
+        application?.type ===
+        'telemetry'
+      ) {
+
+        console.log(
+          'TELEMETRY APP: OK'
+        );
+
+        console.log(
+          'Telemetry type:',
+          application.telemetryType
+        );
+
+        console.log(
+          'Telemetry time:',
+          application.time
+        );
+
+        // ----------------------------------------------
+        // DEVICE METRICS
+        // ----------------------------------------------
+
+        if (
+          application.telemetryType ===
+          'deviceMetrics'
+        ) {
+
+          console.log(
+            'Battery:',
+            application.metrics?.batteryLevel
+          );
+
+          console.log(
+            'Voltage:',
+            application.metrics?.voltage
+          );
+
+          console.log(
+            'Channel utilization:',
+            application.metrics?.channelUtilization
+          );
+
+          console.log(
+            'Air utilization TX:',
+            application.metrics?.airUtilTx
+          );
+
+          console.log(
+            'Uptime seconds:',
+            application.metrics?.uptimeSeconds
+          );
+
+        }
+
+        // ----------------------------------------------
+        // ENVIRONMENT
+        // ----------------------------------------------
+
+        else if (
+          application.telemetryType ===
+          'environmentMetrics'
+        ) {
+
+          console.log(
+            'Temperature:',
+            application.metrics?.temperature
+          );
+
+          console.log(
+            'Humidity:',
+            application.metrics?.relativeHumidity
+          );
+
+          console.log(
+            'Pressure:',
+            application.metrics?.barometricPressure
+          );
+
+        }
+
+        // ----------------------------------------------
+        // OTHER TELEMETRY
+        // ----------------------------------------------
+
+        else {
+
+          console.log(
+            'Telemetry metrics:',
+            JSON.stringify(
+              application.metrics
+            )
+          );
+
+        }
+
+        updateObservedNode(
+          packet.from,
+          {
+            telemetry:
               application
           }
         );
@@ -1195,10 +1638,17 @@ mc.on(
       'reconnecting';
 
     broadcast({
-      type: 'status',
+
+      type:
+        'status',
+
       mqttState,
+
       lastError,
-      topic: TOPIC
+
+      topic:
+        TOPIC
+
     });
 
   }
@@ -1216,10 +1666,17 @@ mc.on(
       'offline';
 
     broadcast({
-      type: 'status',
+
+      type:
+        'status',
+
       mqttState,
+
       lastError,
-      topic: TOPIC
+
+      topic:
+        TOPIC
+
     });
 
   }
@@ -1242,9 +1699,7 @@ mc.on(
 
     console.log(
       'MQTT DISCONNECT:',
-      JSON.stringify(
-        packet
-      )
+      JSON.stringify(packet)
     );
 
   }
@@ -1263,10 +1718,17 @@ mc.on(
     );
 
     broadcast({
-      type: 'status',
+
+      type:
+        'status',
+
       mqttState,
+
       lastError,
-      topic: TOPIC
+
+      topic:
+        TOPIC
+
     });
 
   }
@@ -1331,7 +1793,7 @@ wss.on(
 );
 
 // ======================================================
-// HTTP API - OBSERVED NODES
+// API - OBSERVED NODES
 // ======================================================
 
 app.get(
@@ -1357,7 +1819,7 @@ app.get(
 );
 
 // ======================================================
-// HEALTH
+// API - STATUS
 // ======================================================
 
 app.get(
@@ -1381,14 +1843,22 @@ app.get(
         observedNodes.size,
 
       decoders: {
+
         longFast:
           true,
+
         position:
           true,
+
         nodeInfo:
           true,
+
+        telemetry:
+          true,
+
         text:
           true
+
       }
 
     });
