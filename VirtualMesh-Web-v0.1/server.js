@@ -150,7 +150,8 @@ const variantStats = {
   noPayload: 0,
   noPacket: 0,
   retained: 0,
-  portnum0Rejected: 0
+  portnum0Rejected: 0,
+  plainTextOnProtobufTopic: 0
 };
 
 function plog(...args) {
@@ -1326,6 +1327,16 @@ function handleMessage(topic, payload) {
           pktInteresting = true;
           plog('SAMPLE NO-PAYLOAD RAW HEX:', Buffer.from(payload).toString('hex'));
           plog('SAMPLE NO-PAYLOAD TOPIC:', topic);
+          plog(
+            'SAMPLE NO-PAYLOAD PACKET FIELDS:',
+            JSON.stringify(packet, (k, v) =>
+              typeof v === 'bigint'
+                ? v.toString()
+                : v instanceof Uint8Array
+                  ? Buffer.from(v).toString('hex')
+                  : v
+            )
+          );
         }
         plog(
           'payloadVariant case:',
@@ -1578,6 +1589,24 @@ function handleMessage(topic, payload) {
   } catch (err) {
 
     transportStats.serviceEnvelopeFailed++;
+
+    {
+      const preview = Buffer.from(payload).toString('utf8');
+
+      if (/^[\x20-\x7e\r\n\t]+$/.test(preview)) {
+        variantStats.plainTextOnProtobufTopic++;
+
+        if (variantStats.plainTextOnProtobufTopic <= 10) {
+          pktInteresting = true;
+          plog(
+            'PLAIN TEXT ON PROTOBUF TOPIC (not a Meshtastic packet):',
+            JSON.stringify(preview.slice(0, 200)),
+            'topic:',
+            topic
+          );
+        }
+      }
+    }
 
     plog('SERVICE ENVELOPE DECODE FAILED');
     plog('Transport:', mqttTopicType);
