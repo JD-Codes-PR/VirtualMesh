@@ -34,11 +34,55 @@ const REGIONS = [
   { id: 'PR', name: 'Puerto Rico', topic: 'msh/US/PR/#' },
   { id: 'FL', name: 'Florida', topic: 'msh/US/FL/#' },
   { id: 'TX', name: 'Texas', topic: 'msh/US/TX/#' },
+  // Spain uses the EU_868 radio region. This subscribes to the public EU_868 root;
+  // geographic Spain filtering can be applied from decoded position/map data.
+  { id: 'EU868', name: 'Spain / Europe (EU_868 public root)', topic: 'msh/EU_868/2/#' },
   // Default root topic (gateways without a state sub-topic)
   { id: 'US', name: 'United States (default root)', topic: 'msh/US/2/#' }
 ];
 
 const TOPICS = REGIONS.map(region => region.topic);
+
+// ======================================================
+// LIVE CORE - TEMPORAL CLASSIFICATION
+// ======================================================
+
+const LIVE_MAX_AGE_SECONDS = 15 * 60;
+const RECENT_MAX_AGE_SECONDS = 24 * 60 * 60;
+
+const temporalStats = {
+  live: 0,
+  recent: 0,
+  stale: 0,
+  unknown: 0,
+  staleNoPayloadDiscarded: 0,
+  retainedStaleNoPayloadDiscarded: 0
+};
+
+function classifyPacketAge(packet) {
+  const rx = Number(packet?.rxTime || 0);
+  if (!Number.isFinite(rx) || rx <= 0) {
+    temporalStats.unknown++;
+    return { ageClass: 'UNKNOWN', ageSeconds: null, rxTime: null };
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const ageSeconds = Math.max(0, now - rx);
+  let ageClass;
+
+  if (ageSeconds <= LIVE_MAX_AGE_SECONDS) {
+    ageClass = 'LIVE';
+    temporalStats.live++;
+  } else if (ageSeconds <= RECENT_MAX_AGE_SECONDS) {
+    ageClass = 'RECENT';
+    temporalStats.recent++;
+  } else {
+    ageClass = 'STALE';
+    temporalStats.stale++;
+  }
+
+  return { ageClass, ageSeconds, rxTime: rx };
+}
 
 // ======================================================
 // MQTT CLIENT ID
@@ -1413,7 +1457,27 @@ function handleMessage(topic, payload) {
 
     } else {
 
+      const temporal = classifyPacketAge(packet);
+      const earlyVariantCase = packet?.payloadVariant?.case || null;
+
+      // Keep historical no-payload traffic in analyzer/statistics only.
+      // It must not enter the operational node DB, inbox or WebSocket feed.
+      if (temporal.ageClass === 'STALE' && !earlyVariantCase) {
+        temporalStats.staleNoPayloadDiscarded++;
+        if (pktRetained) temporalStats.retainedStaleNoPayloadDiscarded++;
+
+        variantStats.noPayload++;
+        noPayloadOld++;
+        if (pktRetained) noPayloadRetained++;
+        noPayloadByRegion[region.id] = (noPayloadByRegion[region.id] || 0) + 1;
+        bump(noPayloadByGateway, envelope.gatewayId || '(none)');
+        bump(noPayloadByChannel, envelope.channelId || '(none)');
+
+        return;
+      }
+
       plog('MESH PACKET: OK');
+      plog('Age class:', temporal.ageClass, 'age_s=' + temporal.ageSeconds);
 
       const fromHex = nodeIdToHex(packet.from);
 
@@ -2224,6 +2288,34 @@ app.get('/api/unique-nodes', (req, res) => {
   });
 });
 
+app.get('/api/live-nodes', (req, res) => {
+  const now = Date.now();
+  const liveWindowMs = LIVE_MAX_AGE_SECONDS * 1000;
+  const nodes = Array.from(uniqueNodes.values()).filter(node => {
+    const t = Date.parse(node.lastSeen || node.updatedAt || node.lastHeard || '');
+    return Number.isFinite(t) && (now - t) <= liveWindowMs;
+  });
+
+  res.json({
+    service: 'VirtualMesh',
+    mode: 'READ_ONLY',
+    windowMinutes: LIVE_MAX_AGE_SECONDS / 60,
+    count: nodes.length,
+    temporalStats: { ...temporalStats },
+    nodes
+  });
+});
+
+app.get('/api/temporal-stats', (req, res) => {
+  res.json({
+    service: 'VirtualMesh',
+    mode: 'READ_ONLY',
+    liveMaxAgeSeconds: LIVE_MAX_AGE_SECONDS,
+    recentMaxAgeSeconds: RECENT_MAX_AGE_SECONDS,
+    stats: { ...temporalStats }
+  });
+});
+
 // ======================================================
 // API - TRAFFIC ANALYZER
 // ======================================================
@@ -2379,4 +2471,6 @@ server.listen(PORT, () => {
   console.log('Traffic analyzer endpoint: /api/traffic-analyzer');
   console.log('Normalized message inbox: /api/messages');
   console.log('Global unique nodes: /api/unique-nodes');
+  console.log('Live nodes (15 min): /api/live-nodes');
+  console.log('Temporal stats: /api/temporal-stats');
 });
