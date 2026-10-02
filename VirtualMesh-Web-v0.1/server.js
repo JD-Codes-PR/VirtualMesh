@@ -4,7 +4,7 @@ import { WebSocketServer } from 'ws';
 import mqtt from 'mqtt';
 import crypto from 'crypto';
 import { fromBinary } from '@bufbuild/protobuf';
-import { Mqtt } from '@meshtastic/protobufs';
+import { Mqtt, Mesh, Portnums } from '@meshtastic/protobufs';
 
 // ======================================================
 // VIRTUALMESH CONFIGURATION
@@ -26,10 +26,20 @@ const TOPIC =
   process.env.MQTT_TOPIC ||
   'msh/US/PR/#';
 
-// ID anónimo para esta instancia de VirtualMesh
 const CLIENT_ID =
   'virtualmesh-' +
   crypto.randomBytes(6).toString('hex');
+
+// ======================================================
+// DEFAULT MESHTASTIC LONGFAST PSK
+// ======================================================
+
+const LONGFAST_KEY = Buffer.from([
+  0xd4, 0xf1, 0xbb, 0x3a,
+  0x20, 0x29, 0x07, 0x59,
+  0xf0, 0xbc, 0xff, 0xab,
+  0xcf, 0x4e, 0x69, 0x01
+]);
 
 // ======================================================
 // WEB SERVER
@@ -37,9 +47,7 @@ const CLIENT_ID =
 
 const app = express();
 
-app.use(
-  express.static('public')
-);
+app.use(express.static('public'));
 
 const server =
   http.createServer(app);
@@ -50,17 +58,13 @@ const wss =
     path: '/mesh'
   });
 
-let mqttState =
-  'disconnected';
+let mqttState = 'disconnected';
+let lastError = '';
 
-let lastError =
-  '';
-
-const clients =
-  new Set();
+const clients = new Set();
 
 // ======================================================
-// BROADCAST TO WEB CLIENTS
+// BROADCAST
 // ======================================================
 
 function broadcast(data) {
@@ -71,12 +75,105 @@ function broadcast(data) {
   for (const ws of clients) {
 
     if (ws.readyState === 1) {
-
       ws.send(message);
-
     }
 
   }
+}
+
+// ======================================================
+// NODE ID
+// ======================================================
+
+function nodeIdToHex(nodeId) {
+
+  return (
+    '!' +
+    Number(nodeId)
+      .toString(16)
+      .padStart(8, '0')
+  );
+
+}
+
+// ======================================================
+// PORTNUM NAME
+// ======================================================
+
+function getPortNumName(portnum) {
+
+  try {
+
+    for (
+      const [name, value]
+      of Object.entries(Portnums.PortNum)
+    ) {
+
+      if (value === portnum) {
+        return name;
+      }
+
+    }
+
+  } catch {
+    // fallback below
+  }
+
+  return `PORT_${portnum}`;
+
+}
+
+// ======================================================
+// MESHTASTIC AES-CTR DECRYPTION
+// ======================================================
+
+function decryptLongFast(
+  encrypted,
+  packetId,
+  fromNode
+) {
+
+  const nonce =
+    Buffer.alloc(16);
+
+  /*
+   * Meshtastic nonce:
+   *
+   * bytes 0-7:
+   * packet_id uint64 LE
+   *
+   * bytes 8-11:
+   * from_node uint32 LE
+   *
+   * bytes 12-15:
+   * block counter = 0
+   */
+
+  nonce.writeBigUInt64LE(
+    BigInt(packetId),
+    0
+  );
+
+  nonce.writeUInt32LE(
+    Number(fromNode) >>> 0,
+    8
+  );
+
+  const decipher =
+    crypto.createDecipheriv(
+      'aes-128-ctr',
+      LONGFAST_KEY,
+      nonce
+    );
+
+  decipher.setAutoPadding(false);
+
+  return Buffer.concat([
+    decipher.update(
+      Buffer.from(encrypted)
+    ),
+    decipher.final()
+  ]);
 
 }
 
@@ -86,7 +183,6 @@ function broadcast(data) {
 
 const opts = {
 
-  // MQTT 3.1.1
   protocolVersion: 4,
 
   clientId:
@@ -107,21 +203,15 @@ const opts = {
 };
 
 if (MQTT_USER) {
-
-  opts.username =
-    MQTT_USER;
-
+  opts.username = MQTT_USER;
 }
 
 if (MQTT_PASS) {
-
-  opts.password =
-    MQTT_PASS;
-
+  opts.password = MQTT_PASS;
 }
 
 // ======================================================
-// STARTUP INFO
+// STARTUP
 // ======================================================
 
 console.log(
@@ -160,6 +250,10 @@ console.log(
 );
 
 console.log(
+  'LongFast decoder: ENABLED'
+);
+
+console.log(
   'MQTT protocol: 3.1.1'
 );
 
@@ -186,10 +280,7 @@ mc.on(
   (connack) => {
 
     console.log('');
-
-    console.log(
-      'MQTT CONNECTED'
-    );
+    console.log('MQTT CONNECTED');
 
     console.log(
       'CONNACK:',
@@ -209,9 +300,7 @@ mc.on(
 
     mc.subscribe(
       TOPIC,
-      {
-        qos: 0
-      },
+      { qos: 0 },
       (err, granted) => {
 
         if (err) {
@@ -234,41 +323,20 @@ mc.on(
         }
 
         broadcast({
-
-          type:
-            'status',
-
+          type: 'status',
           mqttState,
-
           lastError,
-
-          topic:
-            TOPIC
-
+          topic: TOPIC
         });
 
       }
     );
 
-    broadcast({
-
-      type:
-        'status',
-
-      mqttState,
-
-      lastError,
-
-      topic:
-        TOPIC
-
-    });
-
   }
 );
 
 // ======================================================
-// MESHTASTIC SERVICE ENVELOPE DECODER
+// MESHTASTIC PACKET RECEIVER
 // ======================================================
 
 mc.on(
@@ -276,7 +344,6 @@ mc.on(
   (topic, payload) => {
 
     console.log('');
-
     console.log(
       '-----------------------------------'
     );
@@ -288,14 +355,13 @@ mc.on(
       'bytes'
     );
 
-    let result =
-      null;
+    let result = null;
 
     try {
 
-      // ==================================================
+      // ================================================
       // SERVICE ENVELOPE
-      // ==================================================
+      // ================================================
 
       const envelope =
         fromBinary(
@@ -310,21 +376,17 @@ mc.on(
       console.log(
         'Gateway ID:',
         envelope.gatewayId ||
-          '(none)'
+        '(none)'
       );
 
       console.log(
         'Channel ID:',
         envelope.channelId ||
-          '(none)'
+        '(none)'
       );
 
       const packet =
         envelope.packet;
-
-      // ==================================================
-      // MESH PACKET
-      // ==================================================
 
       if (!packet) {
 
@@ -332,125 +394,244 @@ mc.on(
           'MESH PACKET: MISSING'
         );
 
-      } else {
+        return;
 
-        console.log(
-          'MESH PACKET: OK'
+      }
+
+      // ================================================
+      // PACKET INFO
+      // ================================================
+
+      console.log(
+        'MESH PACKET: OK'
+      );
+
+      const fromHex =
+        nodeIdToHex(
+          packet.from
         );
 
-        // ==================================================
-        // NODE IDs
-        // ==================================================
+      const isBroadcast =
+        Number(packet.to) ===
+        0xffffffff;
 
-        const fromHex =
-          '!' +
-          Number(packet.from)
-            .toString(16)
-            .padStart(
-              8,
-              '0'
+      const toHex =
+        isBroadcast
+          ? null
+          : nodeIdToHex(
+              packet.to
             );
 
-        const toHex =
-          '!' +
-          Number(packet.to)
-            .toString(16)
-            .padStart(
-              8,
-              '0'
-            );
+      console.log(
+        'From:',
+        packet.from,
+        `(${fromHex})`
+      );
 
-        const isBroadcast =
-          Number(packet.to) ===
-          0xffffffff;
+      console.log(
+        'To:',
+        packet.to,
+        isBroadcast
+          ? '(BROADCAST)'
+          : `(${toHex})`
+      );
+
+      console.log(
+        'Packet ID:',
+        packet.id
+      );
+
+      console.log(
+        'Channel:',
+        packet.channel
+      );
+
+      console.log(
+        'Hop Limit:',
+        packet.hopLimit
+      );
+
+      console.log(
+        'Hop Start:',
+        packet.hopStart
+      );
+
+      // ================================================
+      // PAYLOAD VARIANT
+      // ================================================
+
+      const variant =
+        packet.payloadVariant;
+
+      let payloadType =
+        'UNKNOWN';
+
+      let portnum =
+        null;
+
+      let portName =
+        null;
+
+      let decodedBytes =
+        0;
+
+      let encryptedBytes =
+        0;
+
+      let decryptionSuccess =
+        false;
+
+      let textMessage =
+        null;
+
+      // ================================================
+      // ALREADY DECODED
+      // ================================================
+
+      if (
+        variant?.case ===
+        'decoded'
+      ) {
+
+        payloadType =
+          'DECODED';
+
+        const data =
+          variant.value;
+
+        portnum =
+          data.portnum;
+
+        portName =
+          getPortNumName(
+            portnum
+          );
+
+        decodedBytes =
+          data.payload?.length || 0;
 
         console.log(
-          'From:',
-          packet.from,
-          `(${fromHex})`
+          'Payload: DECODED'
         );
 
         console.log(
-          'To:',
-          packet.to,
-          isBroadcast
-            ? '(BROADCAST)'
-            : `(${toHex})`
+          'PortNum:',
+          portnum,
+          `(${portName})`
         );
 
         console.log(
-          'Packet ID:',
-          packet.id
+          'Decoded bytes:',
+          decodedBytes
         );
 
-        console.log(
-          'Channel:',
-          packet.channel
-        );
-
-        console.log(
-          'Hop Limit:',
-          packet.hopLimit
-        );
-
-        console.log(
-          'Hop Start:',
-          packet.hopStart
-        );
-
-        // ==================================================
-        // PAYLOAD VARIANT
-        // ==================================================
-
-        const variant =
-          packet.payloadVariant;
-
-        let payloadType =
-          'UNKNOWN';
-
-        let portnum =
-          null;
-
-        let decodedBytes =
-          0;
-
-        let encryptedBytes =
-          0;
-
-        // ==================================================
-        // DECODED PAYLOAD
-        // ==================================================
-
+        // TEXT MESSAGE
         if (
-          variant &&
-          variant.case === 'decoded'
+          portName ===
+          'TEXT_MESSAGE_APP'
         ) {
 
-          payloadType =
-            'DECODED';
+          textMessage =
+            Buffer.from(
+              data.payload
+            ).toString(
+              'utf8'
+            );
+
+          console.log(
+            'TEXT MESSAGE:',
+            textMessage
+          );
+
+        }
+
+      }
+
+      // ================================================
+      // ENCRYPTED LONGFAST
+      // ================================================
+
+      else if (
+        variant?.case ===
+        'encrypted'
+      ) {
+
+        payloadType =
+          'ENCRYPTED';
+
+        encryptedBytes =
+          variant.value?.length || 0;
+
+        console.log(
+          'Payload: ENCRYPTED'
+        );
+
+        console.log(
+          'Encrypted bytes:',
+          encryptedBytes
+        );
+
+        try {
+
+          // ============================================
+          // AES-CTR DECRYPT
+          // ============================================
+
+          const plaintext =
+            decryptLongFast(
+              variant.value,
+              packet.id,
+              packet.from
+            );
+
+          console.log(
+            'AES-CTR decrypt: OK'
+          );
+
+          console.log(
+            'Plaintext bytes:',
+            plaintext.length
+          );
+
+          // ============================================
+          // DATA PROTOBUF
+          // ============================================
 
           const data =
-            variant.value;
+            fromBinary(
+              Mesh.DataSchema,
+              plaintext
+            );
+
+          decryptionSuccess =
+            true;
+
+          payloadType =
+            'DECRYPTED';
 
           portnum =
             data.portnum;
 
+          portName =
+            getPortNumName(
+              portnum
+            );
+
           decodedBytes =
-            data.payload
-              ? data.payload.length
-              : 0;
+            data.payload?.length || 0;
 
           console.log(
-            'Payload: DECODED'
+            'DATA PROTOBUF: OK'
           );
 
           console.log(
             'PortNum:',
-            portnum
+            portnum,
+            `(${portName})`
           );
 
           console.log(
-            'Decoded payload bytes:',
+            'Application payload bytes:',
             decodedBytes
           );
 
@@ -469,114 +650,113 @@ mc.on(
             data.replyId
           );
 
-        }
+          // ============================================
+          // TEXT_MESSAGE_APP
+          // ============================================
 
-        // ==================================================
-        // ENCRYPTED PAYLOAD
-        // ==================================================
+          if (
+            portName ===
+            'TEXT_MESSAGE_APP'
+          ) {
 
-        else if (
-          variant &&
-          variant.case === 'encrypted'
-        ) {
+            textMessage =
+              Buffer.from(
+                data.payload
+              ).toString(
+                'utf8'
+              );
 
-          payloadType =
-            'ENCRYPTED';
+            console.log(
+              'TEXT MESSAGE:',
+              textMessage
+            );
 
-          encryptedBytes =
-            variant.value
-              ? variant.value.length
-              : 0;
+          }
 
-          console.log(
-            'Payload: ENCRYPTED'
-          );
-
-          console.log(
-            'Encrypted bytes:',
-            encryptedBytes
-          );
-
-        }
-
-        // ==================================================
-        // UNKNOWN / EMPTY
-        // ==================================================
-
-        else {
+        } catch (decryptError) {
 
           console.log(
-            'Payload: NONE / UNKNOWN'
-          );
-
-          console.log(
-            'payloadVariant case:',
-            variant?.case ||
-              '(none)'
+            'LONGFAST DECRYPT FAILED:',
+            decryptError.message
           );
 
         }
-
-        // ==================================================
-        // STRUCTURED RESULT FOR WEB APP
-        // ==================================================
-
-        result = {
-
-          serviceEnvelope:
-            true,
-
-          gatewayId:
-            envelope.gatewayId ||
-            null,
-
-          channelId:
-            envelope.channelId ||
-            null,
-
-          from:
-            packet.from,
-
-          fromHex,
-
-          to:
-            packet.to,
-
-          toHex:
-            isBroadcast
-              ? null
-              : toHex,
-
-          broadcast:
-            isBroadcast,
-
-          id:
-            packet.id,
-
-          channel:
-            packet.channel,
-
-          hopLimit:
-            packet.hopLimit,
-
-          hopStart:
-            packet.hopStart,
-
-          payloadType,
-
-          portnum,
-
-          decodedBytes,
-
-          encryptedBytes
-
-        };
 
       }
 
-    }
+      else {
 
-    catch (err) {
+        console.log(
+          'Payload: NONE / UNKNOWN'
+        );
+
+        console.log(
+          'payloadVariant case:',
+          variant?.case ||
+          '(none)'
+        );
+
+      }
+
+      // ================================================
+      // WEB RESULT
+      // ================================================
+
+      result = {
+
+        serviceEnvelope:
+          true,
+
+        gatewayId:
+          envelope.gatewayId ||
+          null,
+
+        channelId:
+          envelope.channelId ||
+          null,
+
+        from:
+          packet.from,
+
+        fromHex,
+
+        to:
+          packet.to,
+
+        toHex,
+
+        broadcast:
+          isBroadcast,
+
+        id:
+          packet.id,
+
+        channel:
+          packet.channel,
+
+        hopLimit:
+          packet.hopLimit,
+
+        hopStart:
+          packet.hopStart,
+
+        payloadType,
+
+        encryptedBytes,
+
+        decodedBytes,
+
+        decryptionSuccess,
+
+        portnum,
+
+        portName,
+
+        textMessage
+
+      };
+
+    } catch (err) {
 
       console.error(
         'SERVICE ENVELOPE DECODE ERROR:',
@@ -585,9 +765,9 @@ mc.on(
 
     }
 
-    // ==================================================
-    // SEND PACKET TO BROWSER
-    // ==================================================
+    // ================================================
+    // SEND TO BROWSER
+    // ================================================
 
     broadcast({
 
@@ -597,7 +777,8 @@ mc.on(
       topic,
 
       receivedAt:
-        new Date().toISOString(),
+        new Date()
+          .toISOString(),
 
       bytes:
         payload.length,
@@ -631,17 +812,10 @@ mc.on(
       'reconnecting';
 
     broadcast({
-
-      type:
-        'status',
-
+      type: 'status',
       mqttState,
-
       lastError,
-
-      topic:
-        TOPIC
-
+      topic: TOPIC
     });
 
   }
@@ -659,17 +833,10 @@ mc.on(
       'offline';
 
     broadcast({
-
-      type:
-        'status',
-
+      type: 'status',
       mqttState,
-
       lastError,
-
-      topic:
-        TOPIC
-
+      topic: TOPIC
     });
 
   }
@@ -692,7 +859,9 @@ mc.on(
 
     console.log(
       'MQTT DISCONNECT:',
-      JSON.stringify(packet)
+      JSON.stringify(
+        packet
+      )
     );
 
   }
@@ -711,17 +880,10 @@ mc.on(
     );
 
     broadcast({
-
-      type:
-        'status',
-
+      type: 'status',
       mqttState,
-
       lastError,
-
-      topic:
-        TOPIC
-
+      topic: TOPIC
     });
 
   }
