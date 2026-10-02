@@ -31,7 +31,7 @@ const CLIENT_ID =
   crypto.randomBytes(6).toString('hex');
 
 // ======================================================
-// DEFAULT MESHTASTIC LONGFAST PSK
+// DEFAULT LONGFAST KEY
 // ======================================================
 
 const LONGFAST_KEY = Buffer.from([
@@ -64,7 +64,14 @@ let lastError = '';
 const clients = new Set();
 
 // ======================================================
-// BROADCAST
+// OBSERVED NODES DATABASE
+// Memory only - no persistence yet
+// ======================================================
+
+const observedNodes = new Map();
+
+// ======================================================
+// BROADCAST TO BROWSER
 // ======================================================
 
 function broadcast(data) {
@@ -79,10 +86,11 @@ function broadcast(data) {
     }
 
   }
+
 }
 
 // ======================================================
-// NODE ID
+// NODE ID -> !xxxxxxxx
 // ======================================================
 
 function nodeIdToHex(nodeId) {
@@ -106,7 +114,9 @@ function getPortNumName(portnum) {
 
     for (
       const [name, value]
-      of Object.entries(Portnums.PortNum)
+      of Object.entries(
+        Portnums.PortNum
+      )
     ) {
 
       if (value === portnum) {
@@ -116,7 +126,7 @@ function getPortNumName(portnum) {
     }
 
   } catch {
-    // fallback below
+    // fallback
   }
 
   return `PORT_${portnum}`;
@@ -124,7 +134,43 @@ function getPortNumName(portnum) {
 }
 
 // ======================================================
-// MESHTASTIC AES-CTR DECRYPTION
+// UPDATE OBSERVED NODE
+// ======================================================
+
+function updateObservedNode(
+  nodeId,
+  changes
+) {
+
+  const nodeHex =
+    nodeIdToHex(nodeId);
+
+  const existing =
+    observedNodes.get(nodeHex) || {
+      nodeId: Number(nodeId),
+      nodeHex,
+      firstSeen:
+        new Date().toISOString()
+    };
+
+  const updated = {
+    ...existing,
+    ...changes,
+    lastSeen:
+      new Date().toISOString()
+  };
+
+  observedNodes.set(
+    nodeHex,
+    updated
+  );
+
+  return updated;
+
+}
+
+// ======================================================
+// LONGFAST AES-128-CTR DECRYPTION
 // ======================================================
 
 function decryptLongFast(
@@ -135,19 +181,6 @@ function decryptLongFast(
 
   const nonce =
     Buffer.alloc(16);
-
-  /*
-   * Meshtastic nonce:
-   *
-   * bytes 0-7:
-   * packet_id uint64 LE
-   *
-   * bytes 8-11:
-   * from_node uint32 LE
-   *
-   * bytes 12-15:
-   * block counter = 0
-   */
 
   nonce.writeBigUInt64LE(
     BigInt(packetId),
@@ -178,7 +211,221 @@ function decryptLongFast(
 }
 
 // ======================================================
-// MQTT CONFIGURATION
+// POSITION DECODER
+// ======================================================
+
+function decodePosition(payload) {
+
+  const position =
+    fromBinary(
+      Mesh.PositionSchema,
+      payload
+    );
+
+  let latitude = null;
+  let longitude = null;
+
+  if (
+    position.latitudeI !== undefined &&
+    position.latitudeI !== null
+  ) {
+
+    latitude =
+      position.latitudeI * 1e-7;
+
+  }
+
+  if (
+    position.longitudeI !== undefined &&
+    position.longitudeI !== null
+  ) {
+
+    longitude =
+      position.longitudeI * 1e-7;
+
+  }
+
+  return {
+
+    latitude,
+
+    longitude,
+
+    altitude:
+      position.altitude ?? null,
+
+    time:
+      position.time || null,
+
+    locationSource:
+      position.locationSource ?? null,
+
+    altitudeSource:
+      position.altitudeSource ?? null,
+
+    timestamp:
+      position.timestamp || null,
+
+    timestampMillisAdjust:
+      position.timestampMillisAdjust || null,
+
+    altitudeHae:
+      position.altitudeHae ?? null,
+
+    altitudeGeoidalSeparation:
+      position.altitudeGeoidalSeparation ?? null,
+
+    pdop:
+      position.pdop || null,
+
+    hdop:
+      position.hdop || null,
+
+    vdop:
+      position.vdop || null,
+
+    gpsAccuracy:
+      position.gpsAccuracy || null,
+
+    groundSpeed:
+      position.groundSpeed || null,
+
+    groundTrack:
+      position.groundTrack || null,
+
+    fixQuality:
+      position.fixQuality || null,
+
+    fixType:
+      position.fixType || null,
+
+    satsInView:
+      position.satsInView || null,
+
+    precisionBits:
+      position.precisionBits || null
+
+  };
+
+}
+
+// ======================================================
+// NODEINFO / USER DECODER
+// ======================================================
+
+function decodeNodeInfo(payload) {
+
+  const user =
+    fromBinary(
+      Mesh.UserSchema,
+      payload
+    );
+
+  return {
+
+    id:
+      user.id || null,
+
+    longName:
+      user.longName || null,
+
+    shortName:
+      user.shortName || null,
+
+    hwModel:
+      user.hwModel ?? null,
+
+    isLicensed:
+      user.isLicensed ?? false,
+
+    role:
+      user.role ?? null,
+
+    publicKey:
+      user.publicKey &&
+      user.publicKey.length > 0
+        ? Buffer.from(
+            user.publicKey
+          ).toString('base64')
+        : null
+
+  };
+
+}
+
+// ======================================================
+// APPLICATION PAYLOAD DECODER
+// ======================================================
+
+function decodeApplicationPayload(
+  portName,
+  payload
+) {
+
+  if (!payload) {
+    return null;
+  }
+
+  // --------------------------------------------------
+  // TEXT
+  // --------------------------------------------------
+
+  if (
+    portName ===
+    'TEXT_MESSAGE_APP'
+  ) {
+
+    return {
+      type: 'text',
+      text:
+        Buffer.from(payload)
+          .toString('utf8')
+    };
+
+  }
+
+  // --------------------------------------------------
+  // POSITION
+  // --------------------------------------------------
+
+  if (
+    portName ===
+    'POSITION_APP'
+  ) {
+
+    return {
+      type: 'position',
+      ...decodePosition(payload)
+    };
+
+  }
+
+  // --------------------------------------------------
+  // NODE INFO
+  // --------------------------------------------------
+
+  if (
+    portName ===
+    'NODEINFO_APP'
+  ) {
+
+    return {
+      type: 'nodeinfo',
+      ...decodeNodeInfo(payload)
+    };
+
+  }
+
+  return {
+    type: 'unhandled',
+    bytes:
+      payload.length
+  };
+
+}
+
+// ======================================================
+// MQTT OPTIONS
 // ======================================================
 
 const opts = {
@@ -218,9 +465,7 @@ console.log(
   '==================================='
 );
 
-console.log(
-  'VirtualMesh'
-);
+console.log('VirtualMesh');
 
 console.log(
   'Meshtastic MQTT Receiver'
@@ -254,6 +499,14 @@ console.log(
 );
 
 console.log(
+  'POSITION_APP decoder: ENABLED'
+);
+
+console.log(
+  'NODEINFO_APP decoder: ENABLED'
+);
+
+console.log(
   'MQTT protocol: 3.1.1'
 );
 
@@ -280,7 +533,9 @@ mc.on(
   (connack) => {
 
     console.log('');
-    console.log('MQTT CONNECTED');
+    console.log(
+      'MQTT CONNECTED'
+    );
 
     console.log(
       'CONNACK:',
@@ -336,7 +591,7 @@ mc.on(
 );
 
 // ======================================================
-// MESHTASTIC PACKET RECEIVER
+// MQTT PACKET RECEIVER
 // ======================================================
 
 mc.on(
@@ -344,6 +599,7 @@ mc.on(
   (topic, payload) => {
 
     console.log('');
+
     console.log(
       '-----------------------------------'
     );
@@ -399,7 +655,7 @@ mc.on(
       }
 
       // ================================================
-      // PACKET INFO
+      // PACKET METADATA
       // ================================================
 
       console.log(
@@ -456,8 +712,22 @@ mc.on(
         packet.hopStart
       );
 
+      // Record that node was seen
+      updateObservedNode(
+        packet.from,
+        {
+          lastGateway:
+            envelope.gatewayId ||
+            null,
+
+          channelId:
+            envelope.channelId ||
+            null
+        }
+      );
+
       // ================================================
-      // PAYLOAD VARIANT
+      // PAYLOAD
       // ================================================
 
       const variant =
@@ -472,20 +742,20 @@ mc.on(
       let portName =
         null;
 
-      let decodedBytes =
+      let encryptedBytes =
         0;
 
-      let encryptedBytes =
+      let decodedBytes =
         0;
 
       let decryptionSuccess =
         false;
 
-      let textMessage =
+      let application =
         null;
 
       // ================================================
-      // ALREADY DECODED
+      // ALREADY DECODED DATA
       // ================================================
 
       if (
@@ -521,26 +791,23 @@ mc.on(
         );
 
         console.log(
-          'Decoded bytes:',
+          'Application payload bytes:',
           decodedBytes
         );
 
-        // TEXT MESSAGE
-        if (
-          portName ===
-          'TEXT_MESSAGE_APP'
-        ) {
+        try {
 
-          textMessage =
-            Buffer.from(
+          application =
+            decodeApplicationPayload(
+              portName,
               data.payload
-            ).toString(
-              'utf8'
             );
 
+        } catch (appError) {
+
           console.log(
-            'TEXT MESSAGE:',
-            textMessage
+            'APPLICATION DECODE FAILED:',
+            appError.message
           );
 
         }
@@ -573,10 +840,6 @@ mc.on(
 
         try {
 
-          // ============================================
-          // AES-CTR DECRYPT
-          // ============================================
-
           const plaintext =
             decryptLongFast(
               variant.value,
@@ -592,10 +855,6 @@ mc.on(
             'Plaintext bytes:',
             plaintext.length
           );
-
-          // ============================================
-          // DATA PROTOBUF
-          // ============================================
 
           const data =
             fromBinary(
@@ -650,25 +909,19 @@ mc.on(
             data.replyId
           );
 
-          // ============================================
-          // TEXT_MESSAGE_APP
-          // ============================================
+          try {
 
-          if (
-            portName ===
-            'TEXT_MESSAGE_APP'
-          ) {
-
-            textMessage =
-              Buffer.from(
+            application =
+              decodeApplicationPayload(
+                portName,
                 data.payload
-              ).toString(
-                'utf8'
               );
 
+          } catch (appError) {
+
             console.log(
-              'TEXT MESSAGE:',
-              textMessage
+              'APPLICATION DECODE FAILED:',
+              appError.message
             );
 
           }
@@ -699,7 +952,129 @@ mc.on(
       }
 
       // ================================================
-      // WEB RESULT
+      // APPLICATION OUTPUT
+      // ================================================
+
+      if (
+        application?.type ===
+        'text'
+      ) {
+
+        console.log(
+          'TEXT MESSAGE:',
+          application.text
+        );
+
+      }
+
+      // ================================================
+      // POSITION
+      // ================================================
+
+      if (
+        application?.type ===
+        'position'
+      ) {
+
+        console.log(
+          'POSITION APP: OK'
+        );
+
+        console.log(
+          'Latitude:',
+          application.latitude
+        );
+
+        console.log(
+          'Longitude:',
+          application.longitude
+        );
+
+        console.log(
+          'Altitude:',
+          application.altitude
+        );
+
+        console.log(
+          'Satellites:',
+          application.satsInView
+        );
+
+        console.log(
+          'Precision bits:',
+          application.precisionBits
+        );
+
+        updateObservedNode(
+          packet.from,
+          {
+            position:
+              application
+          }
+        );
+
+      }
+
+      // ================================================
+      // NODEINFO
+      // ================================================
+
+      if (
+        application?.type ===
+        'nodeinfo'
+      ) {
+
+        console.log(
+          'NODEINFO APP: OK'
+        );
+
+        console.log(
+          'Node ID:',
+          application.id
+        );
+
+        console.log(
+          'Long Name:',
+          application.longName
+        );
+
+        console.log(
+          'Short Name:',
+          application.shortName
+        );
+
+        console.log(
+          'Hardware Model:',
+          application.hwModel
+        );
+
+        console.log(
+          'Role:',
+          application.role
+        );
+
+        console.log(
+          'Licensed:',
+          application.isLicensed
+        );
+
+        updateObservedNode(
+          packet.from,
+          {
+            user:
+              application
+          }
+        );
+
+      }
+
+      console.log(
+        'Observed nodes:',
+        observedNodes.size
+      );
+
+      // ================================================
+      // RESULT FOR BROWSER
       // ================================================
 
       result = {
@@ -752,7 +1127,15 @@ mc.on(
 
         portName,
 
-        textMessage
+        application,
+
+        observedNode:
+          observedNodes.get(
+            fromHex
+          ) || null,
+
+        observedNodeCount:
+          observedNodes.size
 
       };
 
@@ -890,7 +1273,7 @@ mc.on(
 );
 
 // ======================================================
-// WEB BROWSER <-> VIRTUALMESH
+// BROWSER <-> VIRTUALMESH
 // ======================================================
 
 wss.on(
@@ -913,7 +1296,24 @@ wss.on(
           TOPIC,
 
         mode:
-          'READ_ONLY'
+          'READ_ONLY',
+
+        observedNodeCount:
+          observedNodes.size
+
+      })
+    );
+
+    ws.send(
+      JSON.stringify({
+
+        type:
+          'nodes',
+
+        nodes:
+          Array.from(
+            observedNodes.values()
+          )
 
       })
     );
@@ -922,12 +1322,76 @@ wss.on(
       'close',
       () => {
 
-        clients.delete(
-          ws
-        );
+        clients.delete(ws);
 
       }
     );
+
+  }
+);
+
+// ======================================================
+// HTTP API - OBSERVED NODES
+// ======================================================
+
+app.get(
+  '/api/nodes',
+  (req, res) => {
+
+    res.json({
+
+      mode:
+        'READ_ONLY',
+
+      count:
+        observedNodes.size,
+
+      nodes:
+        Array.from(
+          observedNodes.values()
+        )
+
+    });
+
+  }
+);
+
+// ======================================================
+// HEALTH
+// ======================================================
+
+app.get(
+  '/api/status',
+  (req, res) => {
+
+    res.json({
+
+      service:
+        'VirtualMesh',
+
+      mqttState,
+
+      topic:
+        TOPIC,
+
+      mode:
+        'READ_ONLY',
+
+      observedNodes:
+        observedNodes.size,
+
+      decoders: {
+        longFast:
+          true,
+        position:
+          true,
+        nodeInfo:
+          true,
+        text:
+          true
+      }
+
+    });
 
   }
 );
