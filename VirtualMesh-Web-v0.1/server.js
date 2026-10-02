@@ -153,6 +153,133 @@ const noPayloadSamplesByRegion = {};
 let noPayloadOld = 0;
 let noPayloadRetained = 0;
 
+// Traffic analyzer: bounded in-memory diagnostics for unusually noisy gateways.
+// Diagnostic only: it does NOT block or drop packets.
+const TRAFFIC_ANALYZER = process.env.TRAFFIC_ANALYZER !== '0';
+const SUSPECT_GATEWAY_THRESHOLD = Number(process.env.SUSPECT_GATEWAY_THRESHOLD || 1000);
+const HASH_CACHE_MAX = Number(process.env.HASH_CACHE_MAX || 20000);
+const trafficGateways = new Map();
+const recentPayloadHashes = new Map();
+
+function getTrafficGateway(gatewayId) {
+  const key = gatewayId || '(none)';
+  let g = trafficGateways.get(key);
+  if (!g) {
+    g = {
+      gatewayId: key,
+      total: 0,
+      decoded: 0,
+      encrypted: 0,
+      noPayload: 0,
+      noPacket: 0,
+      retained: 0,
+      stale24h: 0,
+      live5m: 0,
+      duplicatePayloads: 0,
+      uniquePayloads: 0,
+      firstSeen: null,
+      lastSeen: null,
+      oldestRxTime: null,
+      newestRxTime: null,
+      topics: new Map(),
+      channels: new Map(),
+      senders: new Map(),
+      packetIds: new Map()
+    };
+    trafficGateways.set(key, g);
+  }
+  return g;
+}
+
+function analyzeTraffic({ gatewayId, topic, channelId, packet, payload, retained, variantCase }) {
+  if (!TRAFFIC_ANALYZER) return;
+  const g = getTrafficGateway(gatewayId);
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  g.total++;
+  g.firstSeen ||= nowIso;
+  g.lastSeen = nowIso;
+  bump(g.topics, topic || '(none)');
+  bump(g.channels, channelId || '(none)');
+  if (retained) g.retained++;
+
+  if (!packet) {
+    g.noPacket++;
+  } else {
+    const sender = nodeIdToHex(packet.from || 0);
+    bump(g.senders, sender);
+    bump(g.packetIds, String(packet.id ?? 0));
+    if (variantCase === 'decoded') g.decoded++;
+    else if (variantCase === 'encrypted') g.encrypted++;
+    else g.noPayload++;
+
+    const rx = Number(packet.rxTime || 0);
+    if (rx > 0) {
+      const rxMs = rx * 1000;
+      const age = now - rxMs;
+      if (age > 86400000) g.stale24h++;
+      if (age >= 0 && age <= 300000) g.live5m++;
+      if (!g.oldestRxTime || rx < g.oldestRxTime) g.oldestRxTime = rx;
+      if (!g.newestRxTime || rx > g.newestRxTime) g.newestRxTime = rx;
+    }
+  }
+
+  const hash = crypto.createHash('sha256').update(Buffer.from(payload)).digest('hex').slice(0, 24);
+  if (recentPayloadHashes.has(hash)) {
+    g.duplicatePayloads++;
+    recentPayloadHashes.delete(hash);
+    recentPayloadHashes.set(hash, now);
+  } else {
+    g.uniquePayloads++;
+    recentPayloadHashes.set(hash, now);
+    if (recentPayloadHashes.size > HASH_CACHE_MAX) {
+      const oldest = recentPayloadHashes.keys().next().value;
+      recentPayloadHashes.delete(oldest);
+    }
+  }
+}
+
+function trafficGatewaySummary(g) {
+  return {
+    gatewayId: g.gatewayId,
+    total: g.total,
+    decoded: g.decoded,
+    encrypted: g.encrypted,
+    noPayload: g.noPayload,
+    noPacket: g.noPacket,
+    retained: g.retained,
+    stale24h: g.stale24h,
+    live5m: g.live5m,
+    duplicatePayloads: g.duplicatePayloads,
+    uniquePayloads: g.uniquePayloads,
+    uniqueSenders: g.senders.size,
+    uniquePacketIds: g.packetIds.size,
+    firstSeen: g.firstSeen,
+    lastSeen: g.lastSeen,
+    oldestRxTime: g.oldestRxTime ? new Date(g.oldestRxTime * 1000).toISOString() : null,
+    newestRxTime: g.newestRxTime ? new Date(g.newestRxTime * 1000).toISOString() : null,
+    topTopics: topN(g.topics, 5),
+    topChannels: topN(g.channels, 5),
+    topSenders: topN(g.senders, 5),
+    topPacketIds: topN(g.packetIds, 5)
+  };
+}
+
+function getTrafficAnalyzerSummary() {
+  return Array.from(trafficGateways.values())
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 20)
+    .map(trafficGatewaySummary);
+}
+
+function getSuspectGateways() {
+  return Array.from(trafficGateways.values())
+    .filter(g => g.total >= SUSPECT_GATEWAY_THRESHOLD)
+    .sort((a, b) => b.total - a.total)
+    .map(trafficGatewaySummary);
+}
+
+
 function bump(map, key) {
   map.set(key, (map.get(key) || 0) + 1);
 }
@@ -961,6 +1088,7 @@ console.log('NODEINFO_APP decoder: ENABLED');
 console.log('TELEMETRY_APP decoder: ENABLED');
 console.log('MAP_REPORT_APP decoder: ENABLED');
 console.log('Public key capture: ENABLED');
+console.log('Traffic analyzer:', TRAFFIC_ANALYZER ? 'ENABLED (diagnostic, no blocking)' : 'DISABLED');
 console.log('Per-packet log:', VERBOSE ? 'VERBOSE' : 'QUIET (interesting only + 60s summary)');
 console.log('MQTT publish: DISABLED');
 console.log('===================================');
@@ -1094,6 +1222,16 @@ function handleMessage(topic, payload) {
     plog('Channel ID:', envelope.channelId || '(none)');
 
     const packet = envelope.packet;
+
+    analyzeTraffic({
+      gatewayId: envelope.gatewayId,
+      topic,
+      channelId: envelope.channelId,
+      packet,
+      payload,
+      retained: pktRetained,
+      variantCase: packet?.payloadVariant?.case || null
+    });
 
     if (!packet) {
 
@@ -1754,6 +1892,10 @@ setInterval(() => {
     failed: transportStats.serviceEnvelopeFailed
   }));
   console.log('Public keys:', JSON.stringify(publicKeyStats));
+  if (TRAFFIC_ANALYZER) {
+    const suspects = getSuspectGateways().slice(0, 5);
+    console.log('Traffic analyzer suspects:', JSON.stringify(suspects));
+  }
   console.log('Memory MB:', Math.round(process.memoryUsage().rss / 1048576));
   console.log('===================================');
 
@@ -1858,6 +2000,30 @@ app.get('/api/nodes', (req, res) => {
 });
 
 // ======================================================
+// API - TRAFFIC ANALYZER
+// ======================================================
+
+app.get('/api/traffic-analyzer', (req, res) => {
+  const gateway = String(req.query.gateway || '').trim();
+  let gateways = getTrafficAnalyzerSummary();
+  if (gateway) {
+    const g = trafficGateways.get(gateway);
+    gateways = g ? [trafficGatewaySummary(g)] : [];
+  }
+  res.json({
+    service: 'VirtualMesh',
+    mode: 'READ_ONLY',
+    enabled: TRAFFIC_ANALYZER,
+    blocking: false,
+    suspectThreshold: SUSPECT_GATEWAY_THRESHOLD,
+    hashCacheMax: HASH_CACHE_MAX,
+    trackedGateways: trafficGateways.size,
+    suspects: getSuspectGateways(),
+    gateways
+  });
+});
+
+// ======================================================
 // API - DIAGNOSTICS
 // ======================================================
 
@@ -1891,6 +2057,14 @@ app.get('/api/diagnostics', (req, res) => {
       automaticPkiSkip: false,
       automaticNonLongFastSkip: false,
       directedPacketSkip: false
+    },
+
+    trafficAnalyzer: {
+      enabled: TRAFFIC_ANALYZER,
+      blocking: false,
+      suspectThreshold: SUSPECT_GATEWAY_THRESHOLD,
+      trackedGateways: trafficGateways.size,
+      suspects: getSuspectGateways().slice(0, 10)
     },
 
     compressedText: {
@@ -1971,4 +2145,5 @@ server.listen(PORT, () => {
   console.log('Public keys: CAPTURE');
   console.log('MQTT publish: DISABLED');
   console.log('Diagnostics endpoint: /api/diagnostics');
+  console.log('Traffic analyzer endpoint: /api/traffic-analyzer');
 });
