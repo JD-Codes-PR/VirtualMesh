@@ -141,6 +141,7 @@ let pktInteresting = false;
 let suppressedPackets = 0;
 let totalPackets = 0;
 const seenUnhandledPorts = new Set();
+const seenPlainTexts = new Set();
 let lastSummaryTotal = 0;
 let pktRetained = false;
 
@@ -1642,7 +1643,12 @@ function handleMessage(topic, payload) {
       if (/^[\x20-\x7e\r\n\t]+$/.test(preview)) {
         variantStats.plainTextOnProtobufTopic++;
 
-        if (variantStats.plainTextOnProtobufTopic <= 10) {
+        // Log each DISTINCT plain text once (a bot repeating the same
+        // test string every few seconds would otherwise flood the log).
+        const textKey = preview.slice(0, 200);
+
+        if (!seenPlainTexts.has(textKey) && seenPlainTexts.size < 30) {
+          seenPlainTexts.add(textKey);
           pktInteresting = true;
           plog(
             'PLAIN TEXT ON PROTOBUF TOPIC (not a Meshtastic packet):',
