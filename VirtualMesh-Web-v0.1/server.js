@@ -33,7 +33,9 @@ const MQTT_PASS = process.env.MQTT_PASS || '';
 const REGIONS = [
   { id: 'PR', name: 'Puerto Rico', topic: 'msh/US/PR/#' },
   { id: 'FL', name: 'Florida', topic: 'msh/US/FL/#' },
-  { id: 'TX', name: 'Texas', topic: 'msh/US/TX/#' }
+  { id: 'TX', name: 'Texas', topic: 'msh/US/TX/#' },
+  // Default root topic (gateways without a state sub-topic)
+  { id: 'US', name: 'United States (default root)', topic: 'msh/US/2/#' }
 ];
 
 const TOPICS = REGIONS.map(region => region.topic);
@@ -246,6 +248,7 @@ function addPortStat(portnum, portName, regionId) {
         PR: 0,
         FL: 0,
         TX: 0,
+        US: 0,
         UNKNOWN: 0
       }
     };
@@ -884,7 +887,7 @@ for (const region of REGIONS) {
 }
 
 console.log('Mode: READ ONLY');
-console.log('PR + FL + TX: ENABLED');
+console.log('PR + FL + TX + US(default root): ENABLED');
 console.log('Binary MQTT traffic: TRY SERVICE ENVELOPE');
 console.log('/2/map/ ServiceEnvelope attempt: ENABLED');
 console.log('Other binary ServiceEnvelope attempt: ENABLED');
