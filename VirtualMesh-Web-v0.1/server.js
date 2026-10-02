@@ -126,6 +126,30 @@ const publicKeyStats = {
   }
 };
 
+// ======================================================
+// QUIET LOGGING
+// Render drops log lines when output is too fast.
+// Per-packet logs are buffered and only printed when the
+// packet is "interesting" (or VERBOSE=1). A summary is
+// printed every 60 seconds instead.
+// ======================================================
+
+const VERBOSE = process.env.VERBOSE === '1';
+
+let pktLog = null;
+let pktInteresting = false;
+let suppressedPackets = 0;
+let totalPackets = 0;
+const seenUnhandledPorts = new Set();
+
+function plog(...args) {
+  if (pktLog) {
+    pktLog.push(args);
+  } else {
+    console.log(...args);
+  }
+}
+
 for (const region of REGIONS) {
   regionStats.set(region.id, {
     packets: 0,
@@ -774,8 +798,8 @@ function inspectJsonPacket(region, topic, payload) {
 
   const raw = Buffer.from(payload).toString('utf8');
 
-  console.log('MQTT transport: JSON');
-  console.log('JSON bytes:', payload.length);
+  plog('MQTT transport: JSON');
+  plog('JSON bytes:', payload.length);
 
   try {
 
@@ -803,23 +827,24 @@ function inspectJsonPacket(region, topic, payload) {
     if (possibleText) {
 
       jsonStats.possibleText++;
+      pktInteresting = true;
 
-      console.log('===================================');
-      console.log('POSSIBLE JSON TEXT MESSAGE');
-      console.log('Region:', region.id);
-      console.log('Topic:', topic);
-      console.log('Type:', obj.type);
-      console.log('From:', obj.from);
-      console.log('To:', obj.to);
-      console.log('Payload:', JSON.stringify(obj.payload));
-      console.log('JSON:', JSON.stringify(obj));
-      console.log('===================================');
+      plog('===================================');
+      plog('POSSIBLE JSON TEXT MESSAGE');
+      plog('Region:', region.id);
+      plog('Topic:', topic);
+      plog('Type:', obj.type);
+      plog('From:', obj.from);
+      plog('To:', obj.to);
+      plog('Payload:', JSON.stringify(obj.payload));
+      plog('JSON:', JSON.stringify(obj));
+      plog('===================================');
 
     } else {
 
-      console.log('JSON packet: OK');
-      console.log('JSON type:', obj.type ?? '(none)');
-      console.log(
+      plog('JSON packet: OK');
+      plog('JSON type:', obj.type ?? '(none)');
+      plog(
         'JSON keys:',
         Object.keys(obj).join(', ') || '(none)'
       );
@@ -835,8 +860,8 @@ function inspectJsonPacket(region, topic, payload) {
 
     jsonStats.invalid++;
 
-    console.log('JSON parse: FAILED');
-    console.log('Reason:', err.message);
+    plog('JSON parse: FAILED');
+    plog('Reason:', err.message);
 
     return {
       valid: false,
@@ -903,6 +928,7 @@ console.log('NODEINFO_APP decoder: ENABLED');
 console.log('TELEMETRY_APP decoder: ENABLED');
 console.log('MAP_REPORT_APP decoder: ENABLED');
 console.log('Public key capture: ENABLED');
+console.log('Per-packet log:', VERBOSE ? 'VERBOSE' : 'QUIET (interesting only + 60s summary)');
 console.log('MQTT publish: DISABLED');
 console.log('===================================');
 
@@ -958,7 +984,7 @@ mc.on('connect', connack => {
 // MQTT MESSAGE
 // ======================================================
 
-mc.on('message', (topic, payload) => {
+function handleMessage(topic, payload) {
 
   const region = getRegionFromTopic(topic);
 
@@ -970,11 +996,11 @@ mc.on('message', (topic, payload) => {
 
   addRegionTraffic(region.id, payload.length);
 
-  console.log('');
-  console.log('-----------------------------------');
-  console.log(`REGION: ${region.id} (${region.name})`);
-  console.log('MQTT PACKET:', topic, `${payload.length} bytes`);
-  console.log('MQTT transport:', mqttTopicType.toUpperCase());
+  plog('');
+  plog('-----------------------------------');
+  plog(`REGION: ${region.id} (${region.name})`);
+  plog('MQTT PACKET:', topic, `${payload.length} bytes`);
+  plog('MQTT transport:', mqttTopicType.toUpperCase());
 
   // ==================================================
   // JSON
@@ -1013,7 +1039,7 @@ mc.on('message', (topic, payload) => {
   // other   -> attempt ServiceEnvelope
   // ==================================================
 
-  console.log('ServiceEnvelope decode: WILL ATTEMPT');
+  plog('ServiceEnvelope decode: WILL ATTEMPT');
 
   transportStats.serviceEnvelopeAttempts++;
 
@@ -1030,15 +1056,15 @@ mc.on('message', (topic, payload) => {
 
     transportStats.serviceEnvelopeSuccess++;
 
-    console.log('SERVICE ENVELOPE: OK');
-    console.log('Gateway ID:', envelope.gatewayId || '(none)');
-    console.log('Channel ID:', envelope.channelId || '(none)');
+    plog('SERVICE ENVELOPE: OK');
+    plog('Gateway ID:', envelope.gatewayId || '(none)');
+    plog('Channel ID:', envelope.channelId || '(none)');
 
     const packet = envelope.packet;
 
     if (!packet) {
 
-      console.log('MESH PACKET: MISSING');
+      plog('MESH PACKET: MISSING');
 
       result = {
         serviceEnvelope: true,
@@ -1052,7 +1078,7 @@ mc.on('message', (topic, payload) => {
 
     } else {
 
-      console.log('MESH PACKET: OK');
+      plog('MESH PACKET: OK');
 
       const fromHex = nodeIdToHex(packet.from);
 
@@ -1064,16 +1090,16 @@ mc.on('message', (topic, payload) => {
           ? null
           : nodeIdToHex(packet.to);
 
-      console.log('From:', packet.from, `(${fromHex})`);
-      console.log(
+      plog('From:', packet.from, `(${fromHex})`);
+      plog(
         'To:',
         packet.to,
         isBroadcast ? '(BROADCAST)' : `(${toHex})`
       );
-      console.log('Packet ID:', packet.id);
-      console.log('Channel:', packet.channel);
-      console.log('Hop Limit:', packet.hopLimit);
-      console.log('Hop Start:', packet.hopStart);
+      plog('Packet ID:', packet.id);
+      plog('Channel:', packet.channel);
+      plog('Hop Limit:', packet.hopLimit);
+      plog('Hop Start:', packet.hopStart);
 
       updateObservedNode(region.id, packet.from, {
         lastGateway: envelope.gatewayId || null,
@@ -1124,16 +1150,16 @@ mc.on('message', (topic, payload) => {
 
         decodedBytes = data.payload?.length || 0;
 
-        console.log('Payload: DECODED');
-        console.log('PortNum:', portnum, `(${portName})`);
-        console.log('Application payload bytes:', decodedBytes);
-        console.log('Want response:', data.wantResponse);
-        console.log('Request ID:', data.requestId);
-        console.log('Reply ID:', data.replyId);
+        plog('Payload: DECODED');
+        plog('PortNum:', portnum, `(${portName})`);
+        plog('Application payload bytes:', decodedBytes);
+        plog('Want response:', data.wantResponse);
+        plog('Request ID:', data.requestId);
+        plog('Reply ID:', data.replyId);
 
         addPortStat(portnum, portName, region.id);
 
-        console.log(
+        plog(
           'PORT STATS:',
           JSON.stringify(getPortStatsObject())
         );
@@ -1148,7 +1174,7 @@ mc.on('message', (topic, payload) => {
 
         } catch (appError) {
 
-          console.log(
+          plog(
             'APPLICATION DECODE FAILED:',
             appError.message
           );
@@ -1174,13 +1200,13 @@ mc.on('message', (topic, payload) => {
 
         decryptionAttempted = true;
 
-        console.log('Payload: ENCRYPTED');
-        console.log('Encrypted bytes:', encryptedBytes);
-        console.log(
+        plog('Payload: ENCRYPTED');
+        plog('Encrypted bytes:', encryptedBytes);
+        plog(
           'Decrypt attempt channel:',
           envelope.channelId || '(none)'
         );
-        console.log('Trying public LongFast key...');
+        plog('Trying public LongFast key...');
 
         try {
 
@@ -1191,8 +1217,8 @@ mc.on('message', (topic, payload) => {
               packet.from
             );
 
-          console.log('AES-CTR transform: OK');
-          console.log(
+          plog('AES-CTR transform: OK');
+          plog(
             'Plaintext candidate bytes:',
             plaintext.length
           );
@@ -1211,20 +1237,20 @@ mc.on('message', (topic, payload) => {
 
           decodedBytes = data.payload?.length || 0;
 
-          console.log('DATA PROTOBUF: OK');
-          console.log(
+          plog('DATA PROTOBUF: OK');
+          plog(
             'Channel ID:',
             envelope.channelId || '(none)'
           );
-          console.log('PortNum:', portnum, `(${portName})`);
-          console.log('Application payload bytes:', decodedBytes);
-          console.log('Want response:', data.wantResponse);
-          console.log('Request ID:', data.requestId);
-          console.log('Reply ID:', data.replyId);
+          plog('PortNum:', portnum, `(${portName})`);
+          plog('Application payload bytes:', decodedBytes);
+          plog('Want response:', data.wantResponse);
+          plog('Request ID:', data.requestId);
+          plog('Reply ID:', data.replyId);
 
           addPortStat(portnum, portName, region.id);
 
-          console.log(
+          plog(
             'PORT STATS:',
             JSON.stringify(getPortStatsObject())
           );
@@ -1239,7 +1265,7 @@ mc.on('message', (topic, payload) => {
 
           } catch (appError) {
 
-            console.log(
+            plog(
               'APPLICATION DECODE FAILED:',
               appError.message
             );
@@ -1249,13 +1275,13 @@ mc.on('message', (topic, payload) => {
 
           addDecryptAttempt(envelope.channelId, false);
 
-          console.log('DECRYPT / DATA PARSE FAILED');
-          console.log(
+          plog('DECRYPT / DATA PARSE FAILED');
+          plog(
             'Channel ID:',
             envelope.channelId || '(none)'
           );
-          console.log('Reason:', decryptError.message);
-          console.log(
+          plog('Reason:', decryptError.message);
+          plog(
             'Packet retained as observed encrypted traffic.'
           );
         }
@@ -1263,8 +1289,8 @@ mc.on('message', (topic, payload) => {
 
       else {
 
-        console.log('Payload: NONE / UNKNOWN');
-        console.log(
+        plog('Payload: NONE / UNKNOWN');
+        plog(
           'payloadVariant case:',
           variant?.case || '(none)'
         );
@@ -1276,21 +1302,23 @@ mc.on('message', (topic, payload) => {
 
       if (application?.type === 'text') {
 
+        pktInteresting = true;
+
         addRegionMessage(region.id);
 
-        console.log('');
-        console.log('===================================');
-        console.log('TEXT MESSAGE RECEIVED');
-        console.log('===================================');
-        console.log('Region:', region.id);
-        console.log('Channel ID:', envelope.channelId || '(none)');
-        console.log('From:', fromHex);
-        console.log('To:', isBroadcast ? 'BROADCAST' : toHex);
-        console.log('PortNum:', portnum, `(${portName})`);
-        console.log('Message:', application.text);
-        console.log('Gateway:', envelope.gatewayId || '(none)');
-        console.log('===================================');
-        console.log('');
+        plog('');
+        plog('===================================');
+        plog('TEXT MESSAGE RECEIVED');
+        plog('===================================');
+        plog('Region:', region.id);
+        plog('Channel ID:', envelope.channelId || '(none)');
+        plog('From:', fromHex);
+        plog('To:', isBroadcast ? 'BROADCAST' : toHex);
+        plog('PortNum:', portnum, `(${portName})`);
+        plog('Message:', application.text);
+        plog('Gateway:', envelope.gatewayId || '(none)');
+        plog('===================================');
+        plog('');
       }
 
       // ==============================================
@@ -1299,22 +1327,24 @@ mc.on('message', (topic, payload) => {
 
       if (application?.type === 'compressed_text') {
 
+        pktInteresting = true;
+
         addRegionMessage(region.id);
 
-        console.log('');
-        console.log('===================================');
-        console.log('COMPRESSED TEXT MESSAGE DETECTED');
-        console.log('===================================');
-        console.log('Region:', region.id);
-        console.log('Channel ID:', envelope.channelId || '(none)');
-        console.log('From:', fromHex);
-        console.log('To:', isBroadcast ? 'BROADCAST' : toHex);
-        console.log('Compression:', application.compression);
-        console.log('Compressed bytes:', application.bytes);
-        console.log('Payload HEX:', application.hex);
-        console.log('Payload Base64:', application.base64);
-        console.log('===================================');
-        console.log('');
+        plog('');
+        plog('===================================');
+        plog('COMPRESSED TEXT MESSAGE DETECTED');
+        plog('===================================');
+        plog('Region:', region.id);
+        plog('Channel ID:', envelope.channelId || '(none)');
+        plog('From:', fromHex);
+        plog('To:', isBroadcast ? 'BROADCAST' : toHex);
+        plog('Compression:', application.compression);
+        plog('Compressed bytes:', application.bytes);
+        plog('Payload HEX:', application.hex);
+        plog('Payload Base64:', application.base64);
+        plog('===================================');
+        plog('');
       }
 
       // ==============================================
@@ -1323,12 +1353,12 @@ mc.on('message', (topic, payload) => {
 
       if (application?.type === 'position') {
 
-        console.log('POSITION APP: OK');
-        console.log('Latitude:', application.latitude);
-        console.log('Longitude:', application.longitude);
-        console.log('Altitude:', application.altitude);
-        console.log('Satellites:', application.satsInView);
-        console.log('Precision bits:', application.precisionBits);
+        plog('POSITION APP: OK');
+        plog('Latitude:', application.latitude);
+        plog('Longitude:', application.longitude);
+        plog('Altitude:', application.altitude);
+        plog('Satellites:', application.satsInView);
+        plog('Precision bits:', application.precisionBits);
 
         updateObservedNode(region.id, packet.from, {
           position: application
@@ -1341,12 +1371,12 @@ mc.on('message', (topic, payload) => {
 
       if (application?.type === 'nodeinfo') {
 
-        console.log('NODEINFO APP: OK');
-        console.log('Node ID:', application.id);
-        console.log('Long Name:', application.longName);
-        console.log('Short Name:', application.shortName);
-        console.log('Hardware Model:', application.hwModel);
-        console.log('Role:', application.role);
+        plog('NODEINFO APP: OK');
+        plog('Node ID:', application.id);
+        plog('Long Name:', application.longName);
+        plog('Short Name:', application.shortName);
+        plog('Hardware Model:', application.hwModel);
+        plog('Role:', application.role);
 
         updateObservedNode(region.id, packet.from, {
           user: application
@@ -1369,23 +1399,23 @@ mc.on('message', (topic, payload) => {
 
       if (application?.type === 'telemetry') {
 
-        console.log('TELEMETRY APP: OK');
-        console.log('Telemetry type:', application.telemetryType);
-        console.log('Telemetry time:', application.time);
+        plog('TELEMETRY APP: OK');
+        plog('Telemetry type:', application.telemetryType);
+        plog('Telemetry time:', application.time);
 
         if (application.telemetryType === 'deviceMetrics') {
 
-          console.log('Battery:', application.metrics?.batteryLevel);
-          console.log('Voltage:', application.metrics?.voltage);
-          console.log(
+          plog('Battery:', application.metrics?.batteryLevel);
+          plog('Voltage:', application.metrics?.voltage);
+          plog(
             'Channel utilization:',
             application.metrics?.channelUtilization
           );
-          console.log(
+          plog(
             'Air utilization TX:',
             application.metrics?.airUtilTx
           );
-          console.log(
+          plog(
             'Uptime seconds:',
             application.metrics?.uptimeSeconds
           );
@@ -1393,9 +1423,9 @@ mc.on('message', (topic, payload) => {
 
         else if (application.telemetryType === 'environmentMetrics') {
 
-          console.log('Temperature:', application.metrics?.temperature);
-          console.log('Humidity:', application.metrics?.relativeHumidity);
-          console.log('Pressure:', application.metrics?.barometricPressure);
+          plog('Temperature:', application.metrics?.temperature);
+          plog('Humidity:', application.metrics?.relativeHumidity);
+          plog('Pressure:', application.metrics?.barometricPressure);
         }
 
         updateObservedNode(region.id, packet.from, {
@@ -1409,28 +1439,30 @@ mc.on('message', (topic, payload) => {
 
       if (application?.type === 'mapreport') {
 
-        console.log('');
-        console.log('===================================');
-        console.log('MAP REPORT: OK');
-        console.log('===================================');
-        console.log('Region:', region.id);
-        console.log('Node:', fromHex);
-        console.log('Long Name:', application.longName);
-        console.log('Short Name:', application.shortName);
-        console.log('Hardware Model:', application.hwModel);
-        console.log('Role:', application.role);
-        console.log('Firmware:', application.firmwareVersion);
-        console.log('LoRa Region:', application.region);
-        console.log('Modem Preset:', application.modemPreset);
-        console.log('Default Channel:', application.hasDefaultChannel);
-        console.log('Latitude:', application.latitude);
-        console.log('Longitude:', application.longitude);
-        console.log('Altitude:', application.altitude);
-        console.log('Position Precision:', application.positionPrecision);
-        console.log('Online Local Nodes:', application.numOnlineLocalNodes);
-        console.log('Location Opt-In:', application.hasOptedReportLocation);
-        console.log('===================================');
-        console.log('');
+        pktInteresting = true;
+
+        plog('');
+        plog('===================================');
+        plog('MAP REPORT: OK');
+        plog('===================================');
+        plog('Region:', region.id);
+        plog('Node:', fromHex);
+        plog('Long Name:', application.longName);
+        plog('Short Name:', application.shortName);
+        plog('Hardware Model:', application.hwModel);
+        plog('Role:', application.role);
+        plog('Firmware:', application.firmwareVersion);
+        plog('LoRa Region:', application.region);
+        plog('Modem Preset:', application.modemPreset);
+        plog('Default Channel:', application.hasDefaultChannel);
+        plog('Latitude:', application.latitude);
+        plog('Longitude:', application.longitude);
+        plog('Altitude:', application.altitude);
+        plog('Position Precision:', application.positionPrecision);
+        plog('Online Local Nodes:', application.numOnlineLocalNodes);
+        plog('Location Opt-In:', application.hasOptedReportLocation);
+        plog('===================================');
+        plog('');
 
         updateObservedNode(region.id, packet.from, {
           mapReport: application
@@ -1443,10 +1475,15 @@ mc.on('message', (topic, payload) => {
 
       if (application?.type === 'unhandled') {
 
-        console.log('UNHANDLED APPLICATION PORT');
-        console.log('Port:', application.portName);
-        console.log('Bytes:', application.bytes);
-        console.log('HEX:', application.hex);
+        if (!seenUnhandledPorts.has(application.portName)) {
+          seenUnhandledPorts.add(application.portName);
+          pktInteresting = true;
+        }
+
+        plog('UNHANDLED APPLICATION PORT');
+        plog('Port:', application.portName);
+        plog('Bytes:', application.bytes);
+        plog('HEX:', application.hex);
       }
 
       // ==============================================
@@ -1455,8 +1492,8 @@ mc.on('message', (topic, payload) => {
 
       const nodeCounts = getNodeCountsByRegion();
 
-      console.log('Observed nodes:', observedNodes.size);
-      console.log('By region:', JSON.stringify(nodeCounts));
+      plog('Observed nodes:', observedNodes.size);
+      plog('By region:', JSON.stringify(nodeCounts));
 
       // ==============================================
       // RESULT
@@ -1505,12 +1542,12 @@ mc.on('message', (topic, payload) => {
 
     transportStats.serviceEnvelopeFailed++;
 
-    console.log('SERVICE ENVELOPE DECODE FAILED');
-    console.log('Transport:', mqttTopicType);
-    console.log('Topic:', topic);
-    console.log('Bytes:', payload.length);
-    console.log('Reason:', err.message);
-    console.log('Raw HEX:', Buffer.from(payload).toString('hex'));
+    plog('SERVICE ENVELOPE DECODE FAILED');
+    plog('Transport:', mqttTopicType);
+    plog('Topic:', topic);
+    plog('Bytes:', payload.length);
+    plog('Reason:', err.message);
+    plog('Raw HEX:', Buffer.from(payload).toString('hex'));
 
     result = {
       serviceEnvelope: false,
@@ -1537,7 +1574,59 @@ mc.on('message', (topic, payload) => {
     bytes: payload.length,
     decoded: result
   });
+}
+
+mc.on('message', (topic, payload) => {
+
+  pktLog = [];
+  pktInteresting = false;
+  totalPackets++;
+
+  try {
+    handleMessage(topic, payload);
+  } catch (err) {
+    console.error('HANDLER ERROR:', err.message);
+  } finally {
+
+    const buffered = pktLog;
+    pktLog = null;
+
+    if (VERBOSE || pktInteresting) {
+      for (const args of buffered) {
+        console.log(...args);
+      }
+    } else {
+      suppressedPackets++;
+    }
+  }
 });
+
+setInterval(() => {
+
+  console.log('');
+  console.log('========== SUMMARY (60s) ==========');
+  console.log('Total packets:', totalPackets);
+  console.log('Suppressed from log:', suppressedPackets);
+  console.log('Observed nodes:', observedNodes.size);
+  console.log('Nodes by region:', JSON.stringify(getNodeCountsByRegion()));
+  console.log('Region traffic:', JSON.stringify(getRegionStatsObject()));
+  console.log('Ports:', JSON.stringify(
+    getPortStatsObject().map(p => `${p.portName}=${p.total}`)
+  ));
+  console.log('Decrypt:', JSON.stringify({
+    attempts: decryptStats.attempts,
+    success: decryptStats.success,
+    failed: decryptStats.failed
+  }));
+  console.log('Envelope:', JSON.stringify({
+    ok: transportStats.serviceEnvelopeSuccess,
+    failed: transportStats.serviceEnvelopeFailed
+  }));
+  console.log('Public keys:', JSON.stringify(publicKeyStats));
+  console.log('Memory MB:', Math.round(process.memoryUsage().rss / 1048576));
+  console.log('===================================');
+
+}, 60000);
 
 // ======================================================
 // MQTT CONNECTION EVENTS
