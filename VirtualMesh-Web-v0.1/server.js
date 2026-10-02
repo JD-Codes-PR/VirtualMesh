@@ -4,6 +4,7 @@ import { WebSocketServer } from 'ws';
 import mqtt from 'mqtt';
 import crypto from 'crypto';
 import { fromBinary } from '@bufbuild/protobuf';
+
 import {
   Mqtt,
   Mesh,
@@ -12,20 +13,25 @@ import {
 } from '@meshtastic/protobufs';
 
 // ======================================================
-// VIRTUALMESH CONFIGURATION
+// VIRTUALMESH
+// READ ONLY MQTT RECEIVER
 // ======================================================
 
-const PORT = process.env.PORT || 8080;
+const PORT =
+  process.env.PORT || 8080;
 
 const MQTT_URL =
   process.env.MQTT_URL ||
   'mqtts://mqtt.meshtastic.org:8883';
 
-const MQTT_USER = process.env.MQTT_USER || '';
-const MQTT_PASS = process.env.MQTT_PASS || '';
+const MQTT_USER =
+  process.env.MQTT_USER || '';
+
+const MQTT_PASS =
+  process.env.MQTT_PASS || '';
 
 // ======================================================
-// PUBLIC REGIONS
+// REGIONS
 // ======================================================
 
 const REGIONS = [
@@ -47,54 +53,77 @@ const REGIONS = [
 ];
 
 const TOPICS =
-  REGIONS.map(region => region.topic);
+  REGIONS.map(
+    region => region.topic
+  );
+
+// ======================================================
+// MQTT CLIENT ID
+// ======================================================
 
 const CLIENT_ID =
   'virtualmesh-' +
-  crypto.randomBytes(6).toString('hex');
+  crypto
+    .randomBytes(6)
+    .toString('hex');
 
 // ======================================================
-// DEFAULT LONGFAST KEY
+// DEFAULT PUBLIC LONGFAST KEY
 // ======================================================
 
-const LONGFAST_KEY = Buffer.from([
-  0xd4, 0xf1, 0xbb, 0x3a,
-  0x20, 0x29, 0x07, 0x59,
-  0xf0, 0xbc, 0xff, 0xab,
-  0xcf, 0x4e, 0x69, 0x01
-]);
+const LONGFAST_KEY =
+  Buffer.from([
+    0xd4, 0xf1, 0xbb, 0x3a,
+    0x20, 0x29, 0x07, 0x59,
+    0xf0, 0xbc, 0xff, 0xab,
+    0xcf, 0x4e, 0x69, 0x01
+  ]);
 
 // ======================================================
-// WEB SERVER
+// EXPRESS / WEBSOCKET
 // ======================================================
 
-const app = express();
+const app =
+  express();
 
-app.use(express.static('public'));
+app.use(
+  express.static('public')
+);
 
-const server = http.createServer(app);
+const server =
+  http.createServer(app);
 
-const wss = new WebSocketServer({
-  server,
-  path: '/mesh'
-});
+const wss =
+  new WebSocketServer({
+    server,
+    path: '/mesh'
+  });
 
-let mqttState = 'disconnected';
-let lastError = '';
+const clients =
+  new Set();
 
-const clients = new Set();
+let mqttState =
+  'disconnected';
+
+let lastError =
+  '';
 
 // ======================================================
 // OBSERVED NODES
 // ======================================================
 
-const observedNodes = new Map();
+const observedNodes =
+  new Map();
 
 // ======================================================
-// DIAGNOSTICS
+// STATISTICS
 // ======================================================
 
-const portStats = new Map();
+const portStats =
+  new Map();
+
+const regionStats =
+  new Map();
 
 const jsonStats = {
   packets: 0,
@@ -103,72 +132,17 @@ const jsonStats = {
   possibleText: 0
 };
 
-const directedStats = {
-  packets: 0,
-  skipped: 0
+const decryptStats = {
+  attempts: 0,
+  success: 0,
+  failed: 0,
+  byChannel: {}
 };
 
-// ======================================================
-// PORT STATISTICS
-// ======================================================
-
-function addPortStat(
-  portnum,
-  portName,
-  regionId
+for (
+  const region
+  of REGIONS
 ) {
-
-  const key = String(portnum);
-
-  const existing =
-    portStats.get(key) || {
-      portnum,
-      portName,
-      total: 0,
-      byRegion: {
-        PR: 0,
-        FL: 0,
-        TX: 0,
-        UNKNOWN: 0
-      }
-    };
-
-  existing.total++;
-
-  if (
-    existing.byRegion[regionId] ===
-    undefined
-  ) {
-    existing.byRegion[regionId] = 0;
-  }
-
-  existing.byRegion[regionId]++;
-
-  existing.portName = portName;
-
-  portStats.set(
-    key,
-    existing
-  );
-}
-
-function getPortStatsObject() {
-
-  return Array.from(
-    portStats.values()
-  ).sort(
-    (a, b) =>
-      b.total - a.total
-  );
-}
-
-// ======================================================
-// REGION STATISTICS
-// ======================================================
-
-const regionStats = new Map();
-
-for (const region of REGIONS) {
 
   regionStats.set(
     region.id,
@@ -180,55 +154,8 @@ for (const region of REGIONS) {
   );
 }
 
-function addRegionTraffic(
-  regionId,
-  bytes
-) {
-
-  const stats =
-    regionStats.get(regionId);
-
-  if (!stats) {
-    return;
-  }
-
-  stats.packets++;
-  stats.bytes += bytes;
-}
-
-function addRegionMessage(
-  regionId
-) {
-
-  const stats =
-    regionStats.get(regionId);
-
-  if (!stats) {
-    return;
-  }
-
-  stats.messages++;
-}
-
-function getRegionStatsObject() {
-
-  const result = {};
-
-  for (
-    const [regionId, stats]
-    of regionStats.entries()
-  ) {
-
-    result[regionId] = {
-      ...stats
-    };
-  }
-
-  return result;
-}
-
 // ======================================================
-// WEBSOCKET BROADCAST
+// BROADCAST TO WEB CLIENTS
 // ======================================================
 
 function broadcast(data) {
@@ -236,23 +163,31 @@ function broadcast(data) {
   const message =
     JSON.stringify(data);
 
-  for (const ws of clients) {
+  for (
+    const ws
+    of clients
+  ) {
 
-    if (ws.readyState === 1) {
+    if (
+      ws.readyState === 1
+    ) {
       ws.send(message);
     }
   }
 }
 
 // ======================================================
-// REGION FROM MQTT TOPIC
+// REGION
 // ======================================================
 
 function getRegionFromTopic(
   topic
 ) {
 
-  for (const region of REGIONS) {
+  for (
+    const region
+    of REGIONS
+  ) {
 
     const prefix =
       region.topic.replace(
@@ -275,7 +210,7 @@ function getRegionFromTopic(
 }
 
 // ======================================================
-// MQTT TOPIC TYPE
+// MQTT TRANSPORT TYPE
 // ======================================================
 
 function getMqttTopicType(
@@ -351,6 +286,170 @@ function getPortNumName(
 }
 
 // ======================================================
+// PORT STATISTICS
+// ======================================================
+
+function addPortStat(
+  portnum,
+  portName,
+  regionId
+) {
+
+  const key =
+    String(portnum);
+
+  const existing =
+    portStats.get(key) || {
+      portnum,
+      portName,
+      total: 0,
+
+      byRegion: {
+        PR: 0,
+        FL: 0,
+        TX: 0,
+        UNKNOWN: 0
+      }
+    };
+
+  existing.total++;
+
+  if (
+    existing.byRegion[
+      regionId
+    ] === undefined
+  ) {
+
+    existing.byRegion[
+      regionId
+    ] = 0;
+  }
+
+  existing.byRegion[
+    regionId
+  ]++;
+
+  existing.portName =
+    portName;
+
+  portStats.set(
+    key,
+    existing
+  );
+}
+
+function getPortStatsObject() {
+
+  return Array.from(
+    portStats.values()
+  ).sort(
+    (a, b) =>
+      b.total - a.total
+  );
+}
+
+// ======================================================
+// REGION STATISTICS
+// ======================================================
+
+function addRegionTraffic(
+  regionId,
+  bytes
+) {
+
+  const stats =
+    regionStats.get(
+      regionId
+    );
+
+  if (!stats) {
+    return;
+  }
+
+  stats.packets++;
+  stats.bytes += bytes;
+}
+
+function addRegionMessage(
+  regionId
+) {
+
+  const stats =
+    regionStats.get(
+      regionId
+    );
+
+  if (!stats) {
+    return;
+  }
+
+  stats.messages++;
+}
+
+function getRegionStatsObject() {
+
+  const result = {};
+
+  for (
+    const [regionId, stats]
+    of regionStats.entries()
+  ) {
+
+    result[regionId] = {
+      ...stats
+    };
+  }
+
+  return result;
+}
+
+// ======================================================
+// DECRYPT STATISTICS
+// ======================================================
+
+function addDecryptAttempt(
+  channelId,
+  success
+) {
+
+  const channel =
+    channelId ||
+    '(none)';
+
+  decryptStats.attempts++;
+
+  if (
+    !decryptStats
+      .byChannel[channel]
+  ) {
+
+    decryptStats
+      .byChannel[channel] = {
+        attempts: 0,
+        success: 0,
+        failed: 0
+      };
+  }
+
+  const stats =
+    decryptStats
+      .byChannel[channel];
+
+  stats.attempts++;
+
+  if (success) {
+
+    decryptStats.success++;
+    stats.success++;
+
+  } else {
+
+    decryptStats.failed++;
+    stats.failed++;
+  }
+}
+
+// ======================================================
 // OBSERVED NODE
 // ======================================================
 
@@ -361,7 +460,9 @@ function updateObservedNode(
 ) {
 
   const nodeHex =
-    nodeIdToHex(nodeId);
+    nodeIdToHex(
+      nodeId
+    );
 
   const key =
     `${regionId}:${nodeHex}`;
@@ -369,19 +470,29 @@ function updateObservedNode(
   const existing =
     observedNodes.get(key) || {
       region: regionId,
-      nodeId: Number(nodeId),
+
+      nodeId:
+        Number(nodeId),
+
       nodeHex,
+
       firstSeen:
-        new Date().toISOString()
+        new Date()
+          .toISOString()
     };
 
   const updated = {
     ...existing,
     ...changes,
-    region: regionId,
+
+    region:
+      regionId,
+
     nodeHex,
+
     lastSeen:
-      new Date().toISOString()
+      new Date()
+        .toISOString()
   };
 
   observedNodes.set(
@@ -398,7 +509,9 @@ function getObservedNode(
 ) {
 
   const nodeHex =
-    nodeIdToHex(nodeId);
+    nodeIdToHex(
+      nodeId
+    );
 
   return (
     observedNodes.get(
@@ -411,8 +524,14 @@ function getNodeCountsByRegion() {
 
   const counts = {};
 
-  for (const region of REGIONS) {
-    counts[region.id] = 0;
+  for (
+    const region
+    of REGIONS
+  ) {
+
+    counts[
+      region.id
+    ] = 0;
   }
 
   for (
@@ -421,10 +540,14 @@ function getNodeCountsByRegion() {
   ) {
 
     if (
-      counts[node.region] !==
-      undefined
+      counts[
+        node.region
+      ] !== undefined
     ) {
-      counts[node.region]++;
+
+      counts[
+        node.region
+      ]++;
     }
   }
 
@@ -432,10 +555,12 @@ function getNodeCountsByRegion() {
 }
 
 // ======================================================
-// LONGFAST AES-128-CTR
+// AES-128-CTR
+// Uses public LongFast key as test key.
+// Validation happens when Mesh.Data is parsed.
 // ======================================================
 
-function decryptLongFast(
+function decryptWithLongFastKey(
   encrypted,
   packetId,
   fromNode
@@ -461,18 +586,23 @@ function decryptLongFast(
       nonce
     );
 
-  decipher.setAutoPadding(false);
+  decipher.setAutoPadding(
+    false
+  );
 
   return Buffer.concat([
     decipher.update(
-      Buffer.from(encrypted)
+      Buffer.from(
+        encrypted
+      )
     ),
+
     decipher.final()
   ]);
 }
 
 // ======================================================
-// POSITION DECODER
+// POSITION
 // ======================================================
 
 function decodePosition(
@@ -485,27 +615,34 @@ function decodePosition(
       payload
     );
 
-  let latitude = null;
-  let longitude = null;
+  let latitude =
+    null;
+
+  let longitude =
+    null;
 
   if (
     position.latitudeI !==
-    undefined &&
-    position.latitudeI !== null
+      undefined &&
+    position.latitudeI !==
+      null
   ) {
 
     latitude =
-      position.latitudeI * 1e-7;
+      position.latitudeI *
+      1e-7;
   }
 
   if (
     position.longitudeI !==
-    undefined &&
-    position.longitudeI !== null
+      undefined &&
+    position.longitudeI !==
+      null
   ) {
 
     longitude =
-      position.longitudeI * 1e-7;
+      position.longitudeI *
+      1e-7;
   }
 
   return {
@@ -513,27 +650,33 @@ function decodePosition(
     longitude,
 
     altitude:
-      position.altitude ?? null,
+      position.altitude ??
+      null,
 
     time:
-      position.time || null,
+      position.time ||
+      null,
 
     satsInView:
-      position.satsInView || null,
+      position.satsInView ||
+      null,
 
     precisionBits:
-      position.precisionBits || null,
+      position.precisionBits ||
+      null,
 
     groundSpeed:
-      position.groundSpeed || null,
+      position.groundSpeed ||
+      null,
 
     groundTrack:
-      position.groundTrack || null
+      position.groundTrack ||
+      null
   };
 }
 
 // ======================================================
-// NODEINFO DECODER
+// NODEINFO
 // ======================================================
 
 function decodeNodeInfo(
@@ -548,27 +691,33 @@ function decodeNodeInfo(
 
   return {
     id:
-      user.id || null,
+      user.id ||
+      null,
 
     longName:
-      user.longName || null,
+      user.longName ||
+      null,
 
     shortName:
-      user.shortName || null,
+      user.shortName ||
+      null,
 
     hwModel:
-      user.hwModel ?? null,
+      user.hwModel ??
+      null,
 
     isLicensed:
-      user.isLicensed ?? false,
+      user.isLicensed ??
+      false,
 
     role:
-      user.role ?? null
+      user.role ??
+      null
   };
 }
 
 // ======================================================
-// TELEMETRY DECODER
+// TELEMETRY
 // ======================================================
 
 function decodeTelemetry(
@@ -585,18 +734,24 @@ function decodeTelemetry(
     telemetry.variant;
 
   const result = {
-    type: 'telemetry',
+    type:
+      'telemetry',
 
     time:
-      telemetry.time || null,
+      telemetry.time ||
+      null,
 
     telemetryType:
-      variant?.case || 'unknown',
+      variant?.case ||
+      'unknown',
 
-    metrics: null
+    metrics:
+      null
   };
 
-  if (!variant?.case) {
+  if (
+    !variant?.case
+  ) {
     return result;
   }
 
@@ -609,20 +764,26 @@ function decodeTelemetry(
   ) {
 
     result.metrics = {
+
       batteryLevel:
-        value.batteryLevel ?? null,
+        value.batteryLevel ??
+        null,
 
       voltage:
-        value.voltage ?? null,
+        value.voltage ??
+        null,
 
       channelUtilization:
-        value.channelUtilization ?? null,
+        value.channelUtilization ??
+        null,
 
       airUtilTx:
-        value.airUtilTx ?? null,
+        value.airUtilTx ??
+        null,
 
       uptimeSeconds:
-        value.uptimeSeconds ?? null
+        value.uptimeSeconds ??
+        null
     };
   }
 
@@ -632,23 +793,63 @@ function decodeTelemetry(
   ) {
 
     result.metrics = {
+
       temperature:
-        value.temperature ?? null,
+        value.temperature ??
+        null,
 
       relativeHumidity:
-        value.relativeHumidity ?? null,
+        value.relativeHumidity ??
+        null,
 
       barometricPressure:
-        value.barometricPressure ?? null,
+        value.barometricPressure ??
+        null,
 
       gasResistance:
-        value.gasResistance ?? null,
+        value.gasResistance ??
+        null,
 
       voltage:
-        value.voltage ?? null,
+        value.voltage ??
+        null,
 
       current:
-        value.current ?? null
+        value.current ??
+        null
+    };
+  }
+
+  else if (
+    variant.case ===
+    'powerMetrics'
+  ) {
+
+    result.metrics = {
+
+      ch1Voltage:
+        value.ch1Voltage ??
+        null,
+
+      ch1Current:
+        value.ch1Current ??
+        null,
+
+      ch2Voltage:
+        value.ch2Voltage ??
+        null,
+
+      ch2Current:
+        value.ch2Current ??
+        null,
+
+      ch3Voltage:
+        value.ch3Voltage ??
+        null,
+
+      ch3Current:
+        value.ch3Current ??
+        null
     };
   }
 
@@ -663,7 +864,7 @@ function decodeTelemetry(
 }
 
 // ======================================================
-// APPLICATION DECODER
+// APPLICATION PAYLOAD
 // ======================================================
 
 function decodeApplicationPayload(
@@ -675,9 +876,9 @@ function decodeApplicationPayload(
     return null;
   }
 
-  // --------------------------------------------------
-  // NORMAL TEXT
-  // --------------------------------------------------
+  // ==================================================
+  // TEXT MESSAGE
+  // ==================================================
 
   if (
     portName ===
@@ -685,18 +886,22 @@ function decodeApplicationPayload(
   ) {
 
     return {
-      type: 'text',
+      type:
+        'text',
 
       text:
-        Buffer.from(payload)
-          .toString('utf8')
+        Buffer.from(
+          payload
+        ).toString(
+          'utf8'
+        )
     };
   }
 
-  // --------------------------------------------------
+  // ==================================================
   // COMPRESSED TEXT
-  // Detection only
-  // --------------------------------------------------
+  // Detection only for now
+  // ==================================================
 
   if (
     portName ===
@@ -714,18 +919,24 @@ function decodeApplicationPayload(
         payload.length,
 
       hex:
-        Buffer.from(payload)
-          .toString('hex'),
+        Buffer.from(
+          payload
+        ).toString(
+          'hex'
+        ),
 
       base64:
-        Buffer.from(payload)
-          .toString('base64')
+        Buffer.from(
+          payload
+        ).toString(
+          'base64'
+        )
     };
   }
 
-  // --------------------------------------------------
+  // ==================================================
   // POSITION
-  // --------------------------------------------------
+  // ==================================================
 
   if (
     portName ===
@@ -733,14 +944,18 @@ function decodeApplicationPayload(
   ) {
 
     return {
-      type: 'position',
-      ...decodePosition(payload)
+      type:
+        'position',
+
+      ...decodePosition(
+        payload
+      )
     };
   }
 
-  // --------------------------------------------------
+  // ==================================================
   // NODEINFO
-  // --------------------------------------------------
+  // ==================================================
 
   if (
     portName ===
@@ -748,14 +963,18 @@ function decodeApplicationPayload(
   ) {
 
     return {
-      type: 'nodeinfo',
-      ...decodeNodeInfo(payload)
+      type:
+        'nodeinfo',
+
+      ...decodeNodeInfo(
+        payload
+      )
     };
   }
 
-  // --------------------------------------------------
+  // ==================================================
   // TELEMETRY
-  // --------------------------------------------------
+  // ==================================================
 
   if (
     portName ===
@@ -768,16 +987,19 @@ function decodeApplicationPayload(
   }
 
   return {
-    type: 'unhandled',
+    type:
+      'unhandled',
+
     portName,
+
     bytes:
       payload.length
   };
 }
 
 // ======================================================
-// JSON INSPECTION
-// Broadcast only
+// JSON
+// No node-to-node filtering here.
 // ======================================================
 
 function inspectJsonPacket(
@@ -789,8 +1011,11 @@ function inspectJsonPacket(
   jsonStats.packets++;
 
   const raw =
-    Buffer.from(payload)
-      .toString('utf8');
+    Buffer.from(
+      payload
+    ).toString(
+      'utf8'
+    );
 
   console.log(
     'MQTT transport: JSON'
@@ -808,47 +1033,10 @@ function inspectJsonPacket(
 
     jsonStats.valid++;
 
-    const to =
-      obj.to !== undefined
-        ? Number(obj.to)
-        : null;
-
-    const isBroadcast =
-      to === null ||
-      to === 0xffffffff ||
-      to === 4294967295;
-
-    // --------------------------------------------------
-    // DO NOT INSPECT DIRECTED NODE-TO-NODE JSON
-    // --------------------------------------------------
-
-    if (!isBroadcast) {
-
-      directedStats.packets++;
-      directedStats.skipped++;
-
-      console.log(
-        'JSON packet: DIRECTED'
-      );
-
-      console.log(
-        'Application inspection: SKIPPED'
-      );
-
-      console.log(
-        'Reason: Node-to-node packet'
-      );
-
-      return {
-        valid: true,
-        directed: true,
-        skipped: true
-      };
-    }
-
     const type =
       String(
-        obj.type || ''
+        obj.type ||
+        ''
       ).toLowerCase();
 
     const portnum =
@@ -868,9 +1056,12 @@ function inspectJsonPacket(
       portnum === 1 ||
       portnum === 7;
 
-    if (possibleText) {
+    if (
+      possibleText
+    ) {
 
-      jsonStats.possibleText++;
+      jsonStats
+        .possibleText++;
 
       console.log(
         '==================================='
@@ -891,32 +1082,61 @@ function inspectJsonPacket(
       );
 
       console.log(
+        'Type:',
+        obj.type
+      );
+
+      console.log(
+        'From:',
+        obj.from
+      );
+
+      console.log(
+        'To:',
+        obj.to
+      );
+
+      console.log(
+        'Payload:',
+        JSON.stringify(
+          obj.payload
+        )
+      );
+
+      console.log(
         'JSON:',
-        JSON.stringify(obj)
+        JSON.stringify(
+          obj
+        )
       );
 
       console.log(
         '==================================='
       );
-    }
 
-    else {
+    } else {
 
       console.log(
         'JSON packet: OK'
       );
 
       console.log(
+        'JSON type:',
+        obj.type ??
+        '(none)'
+      );
+
+      console.log(
         'JSON keys:',
-        Object.keys(obj)
-          .join(', ') ||
+        Object.keys(
+          obj
+        ).join(', ') ||
         '(none)'
       );
     }
 
     return {
       valid: true,
-      directed: false,
       possibleText,
       data: obj
     };
@@ -938,6 +1158,10 @@ function inspectJsonPacket(
 
     return {
       valid: false,
+
+      possibleText:
+        false,
+
       error:
         err.message
     };
@@ -949,23 +1173,37 @@ function inspectJsonPacket(
 // ======================================================
 
 const opts = {
+
   protocolVersion: 4,
 
   clientId:
     CLIENT_ID,
 
-  reconnectPeriod: 5000,
-  connectTimeout: 15000,
-  keepalive: 60,
-  clean: true
+  reconnectPeriod:
+    5000,
+
+  connectTimeout:
+    15000,
+
+  keepalive:
+    60,
+
+  clean:
+    true
 };
 
-if (MQTT_USER) {
-  opts.username = MQTT_USER;
+if (
+  MQTT_USER
+) {
+  opts.username =
+    MQTT_USER;
 }
 
-if (MQTT_PASS) {
-  opts.password = MQTT_PASS;
+if (
+  MQTT_PASS
+) {
+  opts.password =
+    MQTT_PASS;
 }
 
 // ======================================================
@@ -976,10 +1214,12 @@ console.log(
   '==================================='
 );
 
-console.log('VirtualMesh');
+console.log(
+  'VirtualMesh'
+);
 
 console.log(
-  'Public Broadcast Receiver'
+  'Diagnostic MQTT Receiver'
 );
 
 console.log(
@@ -996,9 +1236,14 @@ console.log(
   CLIENT_ID
 );
 
-console.log('Regions:');
+console.log(
+  'Regions:'
+);
 
-for (const region of REGIONS) {
+for (
+  const region
+  of REGIONS
+) {
 
   console.log(
     ` - ${region.id} | ${region.name} | ${region.topic}`
@@ -1010,15 +1255,23 @@ console.log(
 );
 
 console.log(
-  'Traffic mode: BROADCAST APPLICATION DATA'
+  'PR + FL + TX: ENABLED'
 );
 
 console.log(
-  'Directed node-to-node application decoding: DISABLED'
+  'Encrypted packet decode attempts: ENABLED'
 );
 
 console.log(
-  'LongFast decoder: ENABLED'
+  'LongFast key test: ENABLED'
+);
+
+console.log(
+  'PKI/non-LongFast automatic skip: DISABLED'
+);
+
+console.log(
+  'Directed node-to-node automatic skip: DISABLED'
 );
 
 console.log(
@@ -1042,11 +1295,7 @@ console.log(
 );
 
 console.log(
-  'Non-LongFast decryption: DISABLED'
-);
-
-console.log(
-  'MQTT protocol: 3.1.1'
+  'MQTT publish: DISABLED'
 );
 
 console.log(
@@ -1078,13 +1327,16 @@ mc.on(
 
     console.log(
       'CONNACK:',
-      JSON.stringify(connack)
+      JSON.stringify(
+        connack
+      )
     );
 
     mqttState =
       'connected';
 
-    lastError = '';
+    lastError =
+      '';
 
     console.log(
       'SUBSCRIBING TO:'
@@ -1106,7 +1358,10 @@ mc.on(
       {
         qos: 0
       },
-      (err, granted) => {
+      (
+        err,
+        granted
+      ) => {
 
         if (err) {
 
@@ -1120,17 +1375,25 @@ mc.on(
 
         console.log(
           'SUBACK:',
-          JSON.stringify(granted)
+          JSON.stringify(
+            granted
+          )
         );
       }
     );
 
     broadcast({
-      type: 'status',
+      type:
+        'status',
+
       mqttState,
       lastError,
-      topics: TOPICS,
-      regions: REGIONS
+
+      topics:
+        TOPICS,
+
+      regions:
+        REGIONS
     });
   }
 );
@@ -1141,7 +1404,10 @@ mc.on(
 
 mc.on(
   'message',
-  (topic, payload) => {
+  (
+    topic,
+    payload
+  ) => {
 
     const region =
       getRegionFromTopic(
@@ -1190,7 +1456,8 @@ mc.on(
         );
 
       broadcast({
-        type: 'packet',
+        type:
+          'packet',
 
         region:
           region.id,
@@ -1228,21 +1495,19 @@ mc.on(
 
       console.log(
         'MQTT transport:',
-        mqttTopicType.toUpperCase()
+        mqttTopicType
+          .toUpperCase()
       );
 
       console.log(
         'ServiceEnvelope decode: SKIPPED'
       );
 
-      console.log(
-        'Reason: MQTT topic is not /2/e/'
-      );
-
       return;
     }
 
-    let result = null;
+    let result =
+      null;
 
     try {
 
@@ -1252,7 +1517,8 @@ mc.on(
 
       const envelope =
         fromBinary(
-          Mqtt.ServiceEnvelopeSchema,
+          Mqtt
+            .ServiceEnvelopeSchema,
           payload
         );
 
@@ -1294,7 +1560,9 @@ mc.on(
         );
 
       const isBroadcast =
-        Number(packet.to) ===
+        Number(
+          packet.to
+        ) ===
         0xffffffff;
 
       const toHex =
@@ -1338,10 +1606,6 @@ mc.on(
         packet.hopStart
       );
 
-      // ================================================
-      // ALWAYS RECORD THAT THE NODE WAS SEEN
-      // ================================================
-
       updateObservedNode(
         region.id,
         packet.from,
@@ -1356,152 +1620,35 @@ mc.on(
         }
       );
 
-      // ================================================
-      // DIRECTED NODE-TO-NODE
-      // DO NOT DECRYPT / DO NOT DECODE
-      // ================================================
-
-      if (!isBroadcast) {
-
-        directedStats.packets++;
-        directedStats.skipped++;
-
-        console.log(
-          'DIRECTED NODE-TO-NODE PACKET'
-        );
-
-        console.log(
-          'Application decode: SKIPPED'
-        );
-
-        console.log(
-          'Decryption: SKIPPED'
-        );
-
-        console.log(
-          'Reason: VirtualMesh is processing broadcast application traffic only'
-        );
-
-        const nodeCounts =
-          getNodeCountsByRegion();
-
-        console.log(
-          'Observed nodes:',
-          observedNodes.size
-        );
-
-        console.log(
-          'By region:',
-          JSON.stringify(
-            nodeCounts
-          )
-        );
-
-        result = {
-          serviceEnvelope: true,
-
-          topicType:
-            mqttTopicType,
-
-          region:
-            region.id,
-
-          regionName:
-            region.name,
-
-          gatewayId:
-            envelope.gatewayId ||
-            null,
-
-          channelId:
-            envelope.channelId ||
-            null,
-
-          from:
-            packet.from,
-
-          fromHex,
-
-          to:
-            packet.to,
-
-          toHex,
-
-          broadcast:
-            false,
-
-          directed:
-            true,
-
-          applicationDecode:
-            'SKIPPED',
-
-          decryption:
-            'SKIPPED',
-
-          reason:
-            'Node-to-node packet',
-
-          observedNodeCount:
-            observedNodes.size,
-
-          nodeCounts
-        };
-
-        broadcast({
-          type: 'packet',
-
-          region:
-            region.id,
-
-          regionName:
-            region.name,
-
-          topic,
-
-          topicType:
-            mqttTopicType,
-
-          receivedAt:
-            new Date()
-              .toISOString(),
-
-          bytes:
-            payload.length,
-
-          decoded:
-            result
-        });
-
-        return;
-      }
-
-      // ================================================
-      // FROM THIS POINT: BROADCAST ONLY
-      // ================================================
-
       const variant =
         packet.payloadVariant;
 
       let payloadType =
         'UNKNOWN';
 
-      let portnum = null;
-      let portName = null;
+      let portnum =
+        null;
 
-      let encryptedBytes = 0;
-      let decodedBytes = 0;
+      let portName =
+        null;
+
+      let encryptedBytes =
+        0;
+
+      let decodedBytes =
+        0;
 
       let decryptionSuccess =
         false;
 
-      let decryptionSkipped =
+      let decryptionAttempted =
         false;
 
-      let application = null;
+      let application =
+        null;
 
       // ================================================
-      // ALREADY DECODED BROADCAST
+      // ALREADY DECODED
       // ================================================
 
       if (
@@ -1565,7 +1712,9 @@ mc.on(
 
         }
 
-        catch (appError) {
+        catch (
+          appError
+        ) {
 
           console.log(
             'APPLICATION DECODE FAILED:',
@@ -1575,14 +1724,19 @@ mc.on(
       }
 
       // ================================================
-      // ENCRYPTED LONGFAST BROADCAST
+      // ENCRYPTED
+      //
+      // IMPORTANT:
+      // We no longer automatically skip PKI or
+      // non-LongFast channel IDs.
+      //
+      // We try the public LongFast key and then validate
+      // the result by parsing Mesh.Data.
       // ================================================
 
       else if (
         variant?.case ===
-          'encrypted' &&
-        envelope.channelId ===
-          'LongFast'
+        'encrypted'
       ) {
 
         payloadType =
@@ -1591,6 +1745,9 @@ mc.on(
         encryptedBytes =
           variant.value?.length ||
           0;
+
+        decryptionAttempted =
+          true;
 
         console.log(
           'Payload: ENCRYPTED'
@@ -1601,23 +1758,38 @@ mc.on(
           encryptedBytes
         );
 
+        console.log(
+          'Decrypt attempt channel:',
+          envelope.channelId ||
+          '(none)'
+        );
+
+        console.log(
+          'Trying public LongFast key...'
+        );
+
         try {
 
           const plaintext =
-            decryptLongFast(
+            decryptWithLongFastKey(
               variant.value,
               packet.id,
               packet.from
             );
 
           console.log(
-            'AES-CTR decrypt: OK'
+            'AES-CTR transform: OK'
           );
 
           console.log(
-            'Plaintext bytes:',
+            'Plaintext candidate bytes:',
             plaintext.length
           );
+
+          // --------------------------------------------
+          // The real validation:
+          // Can this candidate parse as Mesh.Data?
+          // --------------------------------------------
 
           const data =
             fromBinary(
@@ -1627,6 +1799,11 @@ mc.on(
 
           decryptionSuccess =
             true;
+
+          addDecryptAttempt(
+            envelope.channelId,
+            true
+          );
 
           payloadType =
             'DECRYPTED';
@@ -1648,6 +1825,12 @@ mc.on(
           );
 
           console.log(
+            'Channel ID:',
+            envelope.channelId ||
+            '(none)'
+          );
+
+          console.log(
             'PortNum:',
             portnum,
             `(${portName})`
@@ -1661,6 +1844,16 @@ mc.on(
           console.log(
             'Want response:',
             data.wantResponse
+          );
+
+          console.log(
+            'Request ID:',
+            data.requestId
+          );
+
+          console.log(
+            'Reply ID:',
+            data.replyId
           );
 
           addPortStat(
@@ -1686,7 +1879,9 @@ mc.on(
 
           }
 
-          catch (appError) {
+          catch (
+            appError
+          ) {
 
             console.log(
               'APPLICATION DECODE FAILED:',
@@ -1695,50 +1890,34 @@ mc.on(
           }
         }
 
-        catch (decryptError) {
+        catch (
+          decryptError
+        ) {
+
+          addDecryptAttempt(
+            envelope.channelId,
+            false
+          );
 
           console.log(
-            'LONGFAST DECRYPT FAILED:',
+            'DECRYPT / DATA PARSE FAILED'
+          );
+
+          console.log(
+            'Channel ID:',
+            envelope.channelId ||
+            '(none)'
+          );
+
+          console.log(
+            'Reason:',
             decryptError.message
           );
+
+          console.log(
+            'Packet ignored; receiver continues.'
+          );
         }
-      }
-
-      // ================================================
-      // NON-LONGFAST
-      // ================================================
-
-      else if (
-        variant?.case ===
-        'encrypted'
-      ) {
-
-        payloadType =
-          'ENCRYPTED';
-
-        encryptedBytes =
-          variant.value?.length ||
-          0;
-
-        decryptionSkipped =
-          true;
-
-        console.log(
-          'Payload: ENCRYPTED'
-        );
-
-        console.log(
-          'Encrypted bytes:',
-          encryptedBytes
-        );
-
-        console.log(
-          'Decryption: SKIPPED'
-        );
-
-        console.log(
-          'Reason: Channel is not LongFast'
-        );
       }
 
       else {
@@ -1755,7 +1934,7 @@ mc.on(
       }
 
       // ================================================
-      // TEXT MESSAGE
+      // NORMAL TEXT MESSAGE
       // ================================================
 
       if (
@@ -1768,6 +1947,10 @@ mc.on(
         );
 
         console.log(
+          ''
+        );
+
+        console.log(
           '==================================='
         );
 
@@ -1776,8 +1959,18 @@ mc.on(
         );
 
         console.log(
+          '==================================='
+        );
+
+        console.log(
           'Region:',
           region.id
+        );
+
+        console.log(
+          'Channel ID:',
+          envelope.channelId ||
+          '(none)'
         );
 
         console.log(
@@ -1786,7 +1979,16 @@ mc.on(
         );
 
         console.log(
-          'To: BROADCAST'
+          'To:',
+          isBroadcast
+            ? 'BROADCAST'
+            : toHex
+        );
+
+        console.log(
+          'PortNum:',
+          portnum,
+          `(${portName})`
         );
 
         console.log(
@@ -1795,7 +1997,17 @@ mc.on(
         );
 
         console.log(
+          'Gateway:',
+          envelope.gatewayId ||
+          '(none)'
+        );
+
+        console.log(
           '==================================='
+        );
+
+        console.log(
+          ''
         );
       }
 
@@ -1813,6 +2025,10 @@ mc.on(
         );
 
         console.log(
+          ''
+        );
+
+        console.log(
           '==================================='
         );
 
@@ -1821,8 +2037,18 @@ mc.on(
         );
 
         console.log(
+          '==================================='
+        );
+
+        console.log(
           'Region:',
           region.id
+        );
+
+        console.log(
+          'Channel ID:',
+          envelope.channelId ||
+          '(none)'
         );
 
         console.log(
@@ -1831,7 +2057,10 @@ mc.on(
         );
 
         console.log(
-          'To: BROADCAST'
+          'To:',
+          isBroadcast
+            ? 'BROADCAST'
+            : toHex
         );
 
         console.log(
@@ -1856,6 +2085,10 @@ mc.on(
 
         console.log(
           '==================================='
+        );
+
+        console.log(
+          ''
         );
       }
 
@@ -1890,11 +2123,6 @@ mc.on(
         console.log(
           'Satellites:',
           application.satsInView
-        );
-
-        console.log(
-          'Precision bits:',
-          application.precisionBits
         );
 
         updateObservedNode(
@@ -2049,7 +2277,7 @@ mc.on(
       }
 
       // ================================================
-      // NODE COUNTS
+      // COUNTS
       // ================================================
 
       const nodeCounts =
@@ -2072,7 +2300,9 @@ mc.on(
       // ================================================
 
       result = {
-        serviceEnvelope: true,
+
+        serviceEnvelope:
+          true,
 
         topicType:
           mqttTopicType,
@@ -2102,10 +2332,7 @@ mc.on(
         toHex,
 
         broadcast:
-          true,
-
-        directed:
-          false,
+          isBroadcast,
 
         id:
           packet.id,
@@ -2123,8 +2350,9 @@ mc.on(
 
         encryptedBytes,
         decodedBytes,
+
+        decryptionAttempted,
         decryptionSuccess,
-        decryptionSkipped,
 
         portnum,
         portName,
@@ -2147,17 +2375,17 @@ mc.on(
         portStats:
           getPortStatsObject(),
 
+        decryptStats,
+
         jsonStats: {
           ...jsonStats
-        },
-
-        directedStats: {
-          ...directedStats
         }
       };
     }
 
-    catch (err) {
+    catch (
+      err
+    ) {
 
       console.error(
         'SERVICE ENVELOPE DECODE ERROR:',
@@ -2170,7 +2398,9 @@ mc.on(
     // ==================================================
 
     broadcast({
-      type: 'packet',
+
+      type:
+        'packet',
 
       region:
         region.id,
@@ -2197,19 +2427,19 @@ mc.on(
 );
 
 // ======================================================
-// MQTT CONNECTION DIAGNOSTICS
+// MQTT EVENTS
 // ======================================================
 
 mc.on(
   'reconnect',
   () => {
 
+    mqttState =
+      'reconnecting';
+
     console.log(
       'MQTT RECONNECTING'
     );
-
-    mqttState =
-      'reconnecting';
   }
 );
 
@@ -2217,12 +2447,12 @@ mc.on(
   'offline',
   () => {
 
+    mqttState =
+      'offline';
+
     console.log(
       'MQTT OFFLINE'
     );
-
-    mqttState =
-      'offline';
   }
 );
 
@@ -2242,7 +2472,9 @@ mc.on(
 
     console.log(
       'MQTT DISCONNECT:',
-      JSON.stringify(packet)
+      JSON.stringify(
+        packet
+      )
     );
   }
 );
@@ -2269,11 +2501,15 @@ wss.on(
   'connection',
   ws => {
 
-    clients.add(ws);
+    clients.add(
+      ws
+    );
 
     ws.send(
       JSON.stringify({
-        type: 'status',
+
+        type:
+          'status',
 
         mqttState,
         lastError,
@@ -2287,9 +2523,6 @@ wss.on(
         mode:
           'READ_ONLY',
 
-        trafficMode:
-          'BROADCAST_ONLY',
-
         observedNodeCount:
           observedNodes.size,
 
@@ -2302,19 +2535,19 @@ wss.on(
         portStats:
           getPortStatsObject(),
 
+        decryptStats,
+
         jsonStats: {
           ...jsonStats
-        },
-
-        directedStats: {
-          ...directedStats
         }
       })
     );
 
     ws.send(
       JSON.stringify({
-        type: 'nodes',
+
+        type:
+          'nodes',
 
         nodes:
           Array.from(
@@ -2329,23 +2562,30 @@ wss.on(
     ws.on(
       'close',
       () => {
-        clients.delete(ws);
+
+        clients.delete(
+          ws
+        );
       }
     );
   }
 );
 
 // ======================================================
-// API - NODES
+// API NODES
 // ======================================================
 
 app.get(
   '/api/nodes',
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
 
     const requestedRegion =
       String(
-        req.query.region || ''
+        req.query.region ||
+        ''
       ).toUpperCase();
 
     let nodes =
@@ -2353,7 +2593,9 @@ app.get(
         observedNodes.values()
       );
 
-    if (requestedRegion) {
+    if (
+      requestedRegion
+    ) {
 
       nodes =
         nodes.filter(
@@ -2364,11 +2606,9 @@ app.get(
     }
 
     res.json({
+
       mode:
         'READ_ONLY',
-
-      trafficMode:
-        'BROADCAST_ONLY',
 
       count:
         nodes.length,
@@ -2388,22 +2628,23 @@ app.get(
 );
 
 // ======================================================
-// API - DIAGNOSTICS
+// API DIAGNOSTICS
 // ======================================================
 
 app.get(
   '/api/diagnostics',
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
 
     res.json({
+
       service:
         'VirtualMesh',
 
       mode:
         'READ_ONLY',
-
-      trafficMode:
-        'BROADCAST_ONLY',
 
       observedNodes:
         observedNodes.size,
@@ -2414,22 +2655,35 @@ app.get(
       portStats:
         getPortStatsObject(),
 
+      regionStats:
+        getRegionStatsObject(),
+
+      decryptStats,
+
       jsonStats: {
         ...jsonStats
       },
 
-      directedTraffic: {
-        decoding:
+      encryptedPacketPolicy: {
+
+        attemptAll:
+          true,
+
+        keyUsed:
+          'LongFast public key',
+
+        automaticPkiSkip:
           false,
 
-        packetsSeen:
-          directedStats.packets,
+        automaticNonLongFastSkip:
+          false,
 
-        packetsSkipped:
-          directedStats.skipped
+        directedPacketSkip:
+          false
       },
 
       compressedText: {
+
         detection:
           true,
 
@@ -2444,14 +2698,18 @@ app.get(
 );
 
 // ======================================================
-// API - STATUS
+// API STATUS
 // ======================================================
 
 app.get(
   '/api/status',
-  (req, res) => {
+  (
+    req,
+    res
+  ) => {
 
     res.json({
+
       service:
         'VirtualMesh',
 
@@ -2466,9 +2724,6 @@ app.get(
       mode:
         'READ_ONLY',
 
-      trafficMode:
-        'BROADCAST_ONLY',
-
       observedNodes:
         observedNodes.size,
 
@@ -2481,41 +2736,54 @@ app.get(
       portStats:
         getPortStatsObject(),
 
+      decryptStats,
+
       jsonStats: {
         ...jsonStats
       },
 
-      directedTraffic: {
-        decoding:
-          false,
-
-        packetsSeen:
-          directedStats.packets,
-
-        packetsSkipped:
-          directedStats.skipped
-      },
-
       mqttTransport: {
-        protobuf: true,
-        json: true,
-        map: false
+
+        protobuf:
+          true,
+
+        json:
+          true,
+
+        map:
+          false
       },
 
       decoders: {
-        longFast: true,
-        position: true,
-        nodeInfo: true,
-        telemetry: true,
-        text: true,
+
+        encryptedPacketAttempt:
+          true,
+
+        automaticPkiSkip:
+          false,
+
+        automaticNonLongFastSkip:
+          false,
+
+        directedNodeToNodeSkip:
+          false,
+
+        position:
+          true,
+
+        nodeInfo:
+          true,
+
+        telemetry:
+          true,
+
+        text:
+          true,
 
         compressedTextDetection:
           true,
 
         compressedTextDecompression:
-          false,
-
-        directedNodeToNode:
           false
       }
     });
@@ -2539,16 +2807,20 @@ server.listen(
     );
 
     console.log(
-      'Traffic mode: BROADCAST ONLY'
-    );
-
-    console.log(
-      'Directed node-to-node decode: DISABLED'
-    );
-
-    console.log(
       'Listening regions:',
       TOPICS.join(', ')
+    );
+
+    console.log(
+      'Encrypted packets: TRY DECODE'
+    );
+
+    console.log(
+      'PKI/non-LongFast skip: OFF'
+    );
+
+    console.log(
+      'Node-to-node skip: OFF'
     );
 
     console.log(
