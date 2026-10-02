@@ -6,6 +6,10 @@ import crypto from 'crypto';
 import { fromBinary } from '@bufbuild/protobuf';
 import { Mqtt } from '@meshtastic/protobufs';
 
+// ======================================================
+// VIRTUALMESH CONFIGURATION
+// ======================================================
+
 const PORT = process.env.PORT || 8080;
 
 const MQTT_URL =
@@ -20,39 +24,60 @@ const MQTT_PASS =
 
 const TOPIC =
   process.env.MQTT_TOPIC ||
-  'msh/US/PR/2/e/LongFast/+';
+  'msh/US/PR/#';
 
 // ID anónimo para esta instancia de VirtualMesh
 const CLIENT_ID =
-  'virtualmesh-' + crypto.randomBytes(6).toString('hex');
+  'virtualmesh-' +
+  crypto.randomBytes(6).toString('hex');
+
+// ======================================================
+// WEB SERVER
+// ======================================================
 
 const app = express();
 
-app.use(express.static('public'));
+app.use(
+  express.static('public')
+);
 
-const server = http.createServer(app);
+const server =
+  http.createServer(app);
 
-const wss = new WebSocketServer({
-  server,
-  path: '/mesh'
-});
+const wss =
+  new WebSocketServer({
+    server,
+    path: '/mesh'
+  });
 
-let mqttState = 'disconnected';
-let lastError = '';
+let mqttState =
+  'disconnected';
 
-const clients = new Set();
+let lastError =
+  '';
+
+const clients =
+  new Set();
+
+// ======================================================
+// BROADCAST TO WEB CLIENTS
+// ======================================================
 
 function broadcast(data) {
 
-  const message = JSON.stringify(data);
+  const message =
+    JSON.stringify(data);
 
   for (const ws of clients) {
 
     if (ws.readyState === 1) {
+
       ws.send(message);
+
     }
 
   }
+
 }
 
 // ======================================================
@@ -61,596 +86,590 @@ function broadcast(data) {
 
 const opts = {
 
-  protocolVersion: 4, // MQTT 3.1.1
+  protocolVersion: 4,
 
-  clientId: CLIENT_ID,
+  clientId:
+    CLIENT_ID,
 
-  reconnectPeriod: 5000,
+  reconnectPeriod:
+    5000,
 
-  connectTimeout: 15000,
+  connectTimeout:
+    15000,
 
-  keepalive: 60,
+  keepalive:
+    60,
 
-  clean: true
+  clean:
+    true
 
 };
 
 if (MQTT_USER) {
-  opts.username = MQTT_USER;
+
+  opts.username =
+    MQTT_USER;
+
 }
 
 if (MQTT_PASS) {
-  opts.password = MQTT_PASS;
+
+  opts.password =
+    MQTT_PASS;
+
 }
 
-console.log('===================================');
-console.log('VirtualMesh');
-console.log('Meshtastic MQTT Receiver');
-console.log('===================================');
-console.log('Broker:', MQTT_URL);
-console.log('Client ID:', CLIENT_ID);
-console.log('Topic:', TOPIC);
-console.log('Mode: READ ONLY');
-console.log('MQTT protocol: 3.1.1');
-console.log('===================================');
+// ======================================================
+// STARTUP INFO
+// ======================================================
 
-const mc = mqtt.connect(
-  MQTT_URL,
-  opts
+console.log(
+  '==================================='
 );
+
+console.log(
+  'VirtualMesh'
+);
+
+console.log(
+  'Meshtastic MQTT Receiver'
+);
+
+console.log(
+  '==================================='
+);
+
+console.log(
+  'Broker:',
+  MQTT_URL
+);
+
+console.log(
+  'Client ID:',
+  CLIENT_ID
+);
+
+console.log(
+  'Topic:',
+  TOPIC
+);
+
+console.log(
+  'Mode: READ ONLY'
+);
+
+console.log(
+  'MQTT protocol: 3.1.1'
+);
+
+console.log(
+  '==================================='
+);
+
+// ======================================================
+// MQTT CLIENT
+// ======================================================
+
+const mc =
+  mqtt.connect(
+    MQTT_URL,
+    opts
+  );
 
 // ======================================================
 // MQTT CONNECT
 // ======================================================
 
-mc.on('connect', (connack) => {
+mc.on(
+  'connect',
+  (connack) => {
 
-  console.log('');
-  console.log('MQTT CONNECTED');
+    console.log('');
 
-  console.log(
-    'CONNACK:',
-    JSON.stringify(connack)
-  );
+    console.log(
+      'MQTT CONNECTED'
+    );
 
-  mqttState = 'connected';
-  lastError = '';
+    console.log(
+      'CONNACK:',
+      JSON.stringify(connack)
+    );
 
-  console.log(
-    'SUBSCRIBE ->',
-    TOPIC
-  );
+    mqttState =
+      'connected';
 
-  mc.subscribe(
-    TOPIC,
-    { qos: 0 },
-    (err, granted) => {
+    lastError =
+      '';
 
-      if (err) {
+    console.log(
+      'SUBSCRIBE ->',
+      TOPIC
+    );
 
-        lastError = err.message;
+    mc.subscribe(
+      TOPIC,
+      {
+        qos: 0
+      },
+      (err, granted) => {
 
-        console.error(
-          'MQTT SUBSCRIBE ERROR:',
-          err.message
-        );
+        if (err) {
 
-      } else {
+          lastError =
+            err.message;
 
-        console.log(
-          'SUBACK:',
-          JSON.stringify(granted)
-        );
+          console.error(
+            'MQTT SUBSCRIBE ERROR:',
+            err.message
+          );
+
+        } else {
+
+          console.log(
+            'SUBACK:',
+            JSON.stringify(granted)
+          );
+
+        }
+
+        broadcast({
+
+          type:
+            'status',
+
+          mqttState,
+
+          lastError,
+
+          topic:
+            TOPIC
+
+        });
 
       }
+    );
 
-      broadcast({
+    broadcast({
 
-        type: 'status',
+      type:
+        'status',
 
-        mqttState,
+      mqttState,
 
-        lastError,
+      lastError,
 
-        topic: TOPIC
+      topic:
+        TOPIC
 
-      });
+    });
 
-    }
-  );
-
-  broadcast({
-
-    type: 'status',
-
-    mqttState,
-
-    lastError,
-
-    topic: TOPIC
-
-  });
-
-});
+  }
+);
 
 // ======================================================
 // MESHTASTIC SERVICE ENVELOPE DECODER
 // ======================================================
 
-mc.on('message', (topic, payload) => {
+mc.on(
+  'message',
+  (topic, payload) => {
 
-  console.log('');
-  console.log('-----------------------------------');
+    console.log('');
 
-  console.log(
-    'MQTT PACKET:',
-    topic,
-    payload.length,
-    'bytes'
-  );
-
-  let result = null;
-
-  try {
-
-    const envelope = fromBinary(
-      Mqtt.ServiceEnvelopeSchema,
-      payload
-    );
-
-    console.log('SERVICE ENVELOPE: OK');
     console.log(
-      'Gateway ID:',
-      envelope.gatewayId || '(none)'
+      '-----------------------------------'
     );
+
     console.log(
-      'Channel ID:',
-      envelope.channelId || '(none)'
+      'MQTT PACKET:',
+      topic,
+      payload.length,
+      'bytes'
     );
 
-    const packet = envelope.packet;
+    let result =
+      null;
 
-    if (!packet) {
-
-      console.log('MESH PACKET: MISSING');
-
-    } else {
-
-      console.log('MESH PACKET: OK');
-
-      // Convertimos IDs numéricos a formato Meshtastic !xxxxxxxx
-      const fromHex =
-        '!' +
-        Number(packet.from)
-          .toString(16)
-          .padStart(8, '0');
-
-      const toHex =
-        '!' +
-        Number(packet.to)
-          .toString(16)
-          .padStart(8, '0');
-
-      const isBroadcast =
-        Number(packet.to) === 0xffffffff;
-
-      console.log(
-        'From:',
-        packet.from,
-        `(${fromHex})`
-      );
-
-      console.log(
-        'To:',
-        packet.to,
-        isBroadcast
-          ? '(BROADCAST)'
-          : `(${toHex})`
-      );
-
-      console.log(
-        'Packet ID:',
-        packet.id
-      );
-
-      console.log(
-        'Channel:',
-        packet.channel
-      );
-
-      console.log(
-        'Hop Limit:',
-        packet.hopLimit
-      );
-
-      console.log(
-        'Hop Start:',
-        packet.hopStart
-      );
+    try {
 
       // --------------------------------
-      // PAYLOAD TYPE
+      // SERVICE ENVELOPE
       // --------------------------------
 
-      const hasEncrypted =
-        packet.encrypted &&
-        packet.encrypted.length > 0;
-
-      const hasDecoded =
-        packet.decoded != null;
-
-      let payloadType = 'UNKNOWN';
-      let portnum = null;
-      let decodedBytes = 0;
-
-      if (hasDecoded) {
-
-        payloadType = 'DECODED';
-
-        portnum =
-          packet.decoded.portnum;
-
-        decodedBytes =
-          packet.decoded.payload
-            ? packet.decoded.payload.length
-            : 0;
-
-        console.log('Payload: DECODED');
-
-        console.log(
-          'PortNum:',
-          portnum
+      const envelope =
+        fromBinary(
+          Mqtt.ServiceEnvelopeSchema,
+          payload
         );
 
-        console.log(
-          'Decoded payload bytes:',
-          decodedBytes
-        );
+      console.log(
+        'SERVICE ENVELOPE: OK'
+      );
+
+      console.log(
+        'Gateway ID:',
+        envelope.gatewayId ||
+          '(none)'
+      );
+
+      console.log(
+        'Channel ID:',
+        envelope.channelId ||
+          '(none)'
+      );
+
+      const packet =
+        envelope.packet;
+
+      // --------------------------------
+      // MESH PACKET
+      // --------------------------------
+
+      if (!packet) {
 
         console.log(
-          'Want response:',
-          packet.decoded.wantResponse
-        );
-
-        console.log(
-          'Request ID:',
-          packet.decoded.requestId
-        );
-
-        console.log(
-          'Reply ID:',
-          packet.decoded.replyId
-        );
-
-      } else if (hasEncrypted) {
-
-        payloadType = 'ENCRYPTED';
-
-        console.log('Payload: ENCRYPTED');
-
-        console.log(
-          'Encrypted bytes:',
-          packet.encrypted.length
+          'MESH PACKET: MISSING'
         );
 
       } else {
 
         console.log(
-          'Payload: NONE / UNKNOWN'
+          'MESH PACKET: OK'
         );
 
-      }
+        // --------------------------------
+        // NODE IDs
+        // --------------------------------
 
-      // --------------------------------
-      // STRUCTURED RESULT FOR WEB APP
-      // --------------------------------
+        const fromHex =
+          '!' +
+          Number(packet.from)
+            .toString(16)
+            .padStart(
+              8,
+              '0'
+            );
 
-      result = {
+        const toHex =
+          '!' +
+          Number(packet.to)
+            .toString(16)
+            .padStart(
+              8,
+              '0'
+            );
 
-        serviceEnvelope: true,
+        const isBroadcast =
+          Number(packet.to) ===
+          0xffffffff;
 
-        gatewayId:
-          envelope.gatewayId || null,
-
-        channelId:
-          envelope.channelId || null,
-
-        from:
+        console.log(
+          'From:',
           packet.from,
+          `(${fromHex})`
+        );
 
-        fromHex,
-
-        to:
+        console.log(
+          'To:',
           packet.to,
-
-        toHex:
           isBroadcast
-            ? null
-            : toHex,
+            ? '(BROADCAST)'
+            : `(${toHex})`
+        );
 
-        broadcast:
-          isBroadcast,
+        console.log(
+          'Packet ID:',
+          packet.id
+        );
 
-        id:
-          packet.id,
+        console.log(
+          'Channel:',
+          packet.channel
+        );
 
-        channel:
-          packet.channel,
+        console.log(
+          'Hop Limit:',
+          packet.hopLimit
+        );
 
-        hopLimit:
-          packet.hopLimit,
+        console.log(
+          'Hop Start:',
+          packet.hopStart
+        );
 
-        hopStart:
-          packet.hopStart,
+        // --------------------------------
+        // PAYLOAD DETECTION
+        // --------------------------------
 
-        payloadType,
+        const hasEncrypted =
+          packet.encrypted &&
+          packet.encrypted.length > 0;
 
-        portnum,
+        const hasDecoded =
+          packet.decoded != null;
 
-        decodedBytes,
+        let payloadType =
+          'UNKNOWN';
 
-        encryptedBytes:
+        let portnum =
+          null;
+
+        let decodedBytes =
+          0;
+
+        // --------------------------------
+        // DECODED PAYLOAD
+        // --------------------------------
+
+        if (hasDecoded) {
+
+          payloadType =
+            'DECODED';
+
+          portnum =
+            packet.decoded.portnum;
+
+          decodedBytes =
+            packet.decoded.payload
+              ? packet.decoded.payload.length
+              : 0;
+
+          console.log(
+            'Payload: DECODED'
+          );
+
+          console.log(
+            'PortNum:',
+            portnum
+          );
+
+          console.log(
+            'Decoded payload bytes:',
+            decodedBytes
+          );
+
+          console.log(
+            'Want response:',
+            packet.decoded.wantResponse
+          );
+
+          console.log(
+            'Request ID:',
+            packet.decoded.requestId
+          );
+
+          console.log(
+            'Reply ID:',
+            packet.decoded.replyId
+          );
+
+        }
+
+        // --------------------------------
+        // ENCRYPTED PAYLOAD
+        // --------------------------------
+
+        else if (
           hasEncrypted
-            ? packet.encrypted.length
-            : 0
+        ) {
 
-      };
+          payloadType =
+            'ENCRYPTED';
 
-    }
+          console.log(
+            'Payload: ENCRYPTED'
+          );
 
-  } catch (err) {
+          console.log(
+            'Encrypted bytes:',
+            packet.encrypted.length
+          );
 
-    console.error(
-      'SERVICE ENVELOPE DECODE ERROR:',
-      err.message
-    );
+        }
 
-  }
+        // --------------------------------
+        // UNKNOWN / EMPTY
+        // --------------------------------
 
-  broadcast({
+        else {
 
-    type: 'packet',
+          console.log(
+            'Payload: NONE / UNKNOWN'
+          );
 
-    topic,
+        }
 
-    receivedAt:
-      new Date().toISOString(),
+        // --------------------------------
+        // RESULT FOR WEB APP
+        // --------------------------------
 
-    bytes:
-      payload.length,
+        result = {
 
-    base64:
-      payload.toString('base64'),
+          serviceEnvelope:
+            true,
 
-    decoded:
-      result
+          gatewayId:
+            envelope.gatewayId ||
+            null,
 
-  });
+          channelId:
+            envelope.channelId ||
+            null,
 
-});
+          from:
+            packet.from,
 
-  let decoded = null;
+          fromHex,
 
-  try {
+          to:
+            packet.to,
 
-    // Meshtastic MQTT binary payload
-    // -> protobuf ServiceEnvelope
+          toHex:
+            isBroadcast
+              ? null
+              : toHex,
 
-    const envelope = fromBinary(
-  Mqtt.ServiceEnvelopeSchema,
-  payload
-);
+          broadcast:
+            isBroadcast,
 
-    console.log(
-      'SERVICE ENVELOPE: OK'
-    );
+          id:
+            packet.id,
 
-    console.log(
-      'Gateway ID:',
-      envelope.gatewayId || '(none)'
-    );
+          channel:
+            packet.channel,
 
-    console.log(
-      'Channel ID:',
-      envelope.channelId || '(none)'
-    );
+          hopLimit:
+            packet.hopLimit,
 
-    const packet =
-      envelope.packet;
+          hopStart:
+            packet.hopStart,
 
-    if (packet) {
+          payloadType,
 
-      console.log(
-        'MESH PACKET: OK'
-      );
+          portnum,
 
-      console.log(
-        'From:',
-        packet.from
-      );
+          decodedBytes,
 
-      console.log(
-        'To:',
-        packet.to
-      );
+          encryptedBytes:
+            hasEncrypted
+              ? packet.encrypted.length
+              : 0
 
-      console.log(
-        'Packet ID:',
-        packet.id
-      );
-
-      console.log(
-        'Channel:',
-        packet.channel
-      );
-
-      console.log(
-        'Hop Limit:',
-        packet.hopLimit
-      );
-
-      console.log(
-        'Hop Start:',
-        packet.hopStart
-      );
-
-      const encrypted =
-        packet.encrypted &&
-        packet.encrypted.length > 0;
-
-      if (encrypted) {
-
-        console.log(
-          'Payload: ENCRYPTED'
-        );
-
-        console.log(
-          'Encrypted bytes:',
-          packet.encrypted.length
-        );
-
-      } else {
-
-        console.log(
-          'Payload: NOT ENCRYPTED'
-        );
+        };
 
       }
 
-      decoded = {
+    }
 
-        serviceEnvelope: true,
+    catch (err) {
 
-        gatewayId:
-          envelope.gatewayId || null,
-
-        channelId:
-          envelope.channelId || null,
-
-        from:
-          packet.from,
-
-        to:
-          packet.to,
-
-        id:
-          packet.id,
-
-        channel:
-          packet.channel,
-
-        hopLimit:
-          packet.hopLimit,
-
-        hopStart:
-          packet.hopStart,
-
-        encrypted:
-          Boolean(encrypted),
-
-        encryptedBytes:
-          encrypted
-            ? packet.encrypted.length
-            : 0
-
-      };
-
-    } else {
-
-      console.log(
-        'MESH PACKET: MISSING'
+      console.error(
+        'SERVICE ENVELOPE DECODE ERROR:',
+        err.message
       );
 
     }
 
-  } catch (err) {
+    // --------------------------------
+    // SEND TO BROWSER
+    // --------------------------------
 
-    console.error(
-      'SERVICE ENVELOPE DECODE ERROR:',
-      err.message
-    );
+    broadcast({
+
+      type:
+        'packet',
+
+      topic,
+
+      receivedAt:
+        new Date().toISOString(),
+
+      bytes:
+        payload.length,
+
+      base64:
+        payload.toString(
+          'base64'
+        ),
+
+      decoded:
+        result
+
+    });
 
   }
-
-  // Enviar resultado al navegador
-  broadcast({
-
-    type: 'packet',
-
-    topic,
-
-    receivedAt:
-      new Date().toISOString(),
-
-    bytes:
-      payload.length,
-
-    base64:
-      payload.toString('base64'),
-
-    decoded
-
-  });
-
-});
+);
 
 // ======================================================
 // MQTT DIAGNOSTICS
 // ======================================================
 
-mc.on('reconnect', () => {
+mc.on(
+  'reconnect',
+  () => {
 
-  console.log(
-    'MQTT RECONNECTING'
-  );
+    console.log(
+      'MQTT RECONNECTING'
+    );
 
-  mqttState =
-    'reconnecting';
+    mqttState =
+      'reconnecting';
 
-  broadcast({
+    broadcast({
 
-    type: 'status',
+      type:
+        'status',
 
-    mqttState,
+      mqttState,
 
-    lastError,
+      lastError,
 
-    topic: TOPIC
+      topic:
+        TOPIC
 
-  });
+    });
 
-});
+  }
+);
 
-mc.on('offline', () => {
+mc.on(
+  'offline',
+  () => {
 
-  console.log(
-    'MQTT OFFLINE'
-  );
+    console.log(
+      'MQTT OFFLINE'
+    );
 
-  mqttState =
-    'offline';
+    mqttState =
+      'offline';
 
-  broadcast({
+    broadcast({
 
-    type: 'status',
+      type:
+        'status',
 
-    mqttState,
+      mqttState,
 
-    lastError,
+      lastError,
 
-    topic: TOPIC
+      topic:
+        TOPIC
 
-  });
+    });
 
-});
+  }
+);
 
-mc.on('close', () => {
+mc.on(
+  'close',
+  () => {
 
-  console.log(
-    'MQTT CONNECTION CLOSED'
-  );
+    console.log(
+      'MQTT CONNECTION CLOSED'
+    );
 
-});
+  }
+);
 
 mc.on(
   'disconnect',
@@ -664,29 +683,34 @@ mc.on(
   }
 );
 
-mc.on('error', (err) => {
+mc.on(
+  'error',
+  (err) => {
 
-  lastError =
-    err.message;
+    lastError =
+      err.message;
 
-  console.error(
-    'MQTT ERROR:',
-    err.message
-  );
+    console.error(
+      'MQTT ERROR:',
+      err.message
+    );
 
-  broadcast({
+    broadcast({
 
-    type: 'status',
+      type:
+        'status',
 
-    mqttState,
+      mqttState,
 
-    lastError,
+      lastError,
 
-    topic: TOPIC
+      topic:
+        TOPIC
 
-  });
+    });
 
-});
+  }
+);
 
 // ======================================================
 // WEB BROWSER <-> VIRTUALMESH
@@ -701,15 +725,18 @@ wss.on(
     ws.send(
       JSON.stringify({
 
-        type: 'status',
+        type:
+          'status',
 
         mqttState,
 
         lastError,
 
-        topic: TOPIC,
+        topic:
+          TOPIC,
 
-        mode: 'READ_ONLY'
+        mode:
+          'READ_ONLY'
 
       })
     );
@@ -718,7 +745,9 @@ wss.on(
       'close',
       () => {
 
-        clients.delete(ws);
+        clients.delete(
+          ws
+        );
 
       }
     );
