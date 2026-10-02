@@ -182,6 +182,28 @@ function getRegionFromTopic(topic) {
 }
 
 // ======================================================
+// MQTT TOPIC TYPE
+// ======================================================
+
+function getMqttTopicType(topic) {
+
+  if (topic.includes('/2/e/')) {
+    return 'protobuf';
+  }
+
+  if (topic.includes('/2/json/')) {
+    return 'json';
+  }
+
+  if (topic.includes('/2/map/')) {
+    return 'map';
+  }
+
+  return 'other';
+
+}
+
+// ======================================================
 // NODE ID
 // ======================================================
 
@@ -1047,7 +1069,11 @@ console.log(
 );
 
 console.log(
-  'PKI LongFast decryption: DISABLED'
+  'Non-Protobuf MQTT topics: FILTERED'
+);
+
+console.log(
+  'Non-LongFast decryption: DISABLED'
 );
 
 console.log(
@@ -1193,6 +1219,72 @@ mc.on(
       payload.length,
       'bytes'
     );
+
+    // ================================================
+    // MQTT TOPIC FILTER
+    //
+    // Meshtastic regional roots can contain multiple
+    // transport formats:
+    //
+    // /2/e/    = binary protobuf ServiceEnvelope
+    // /2/json/ = JSON payload
+    // /2/map/  = map-related topic
+    //
+    // Only /2/e/ is sent to ServiceEnvelope decoder.
+    // ================================================
+
+    const mqttTopicType =
+      getMqttTopicType(topic);
+
+    if (
+      mqttTopicType !==
+      'protobuf'
+    ) {
+
+      console.log(
+        'MQTT transport:',
+        mqttTopicType.toUpperCase()
+      );
+
+      console.log(
+        'ServiceEnvelope decode: SKIPPED'
+      );
+
+      console.log(
+        'Reason: MQTT topic is not /2/e/'
+      );
+
+      broadcast({
+
+        type:
+          'packet',
+
+        region:
+          region.id,
+
+        regionName:
+          region.name,
+
+        topic,
+
+        topicType:
+          mqttTopicType,
+
+        receivedAt:
+          new Date()
+            .toISOString(),
+
+        bytes:
+          payload.length,
+
+        decoded:
+          null
+
+      });
+
+      return;
+
+    }
 
     let result = null;
 
@@ -1404,7 +1496,6 @@ mc.on(
 
       // ================================================
       // ENCRYPTED LONGFAST
-      // Only decrypt actual LongFast envelopes
       // ================================================
 
       else if (
@@ -1530,7 +1621,6 @@ mc.on(
 
       // ================================================
       // ENCRYPTED NON-LONGFAST
-      // PKI or another channel
       // ================================================
 
       else if (
@@ -1755,10 +1845,6 @@ mc.on(
           application.time
         );
 
-        // ----------------------------------------------
-        // DEVICE METRICS
-        // ----------------------------------------------
-
         if (
           application.telemetryType ===
           'deviceMetrics'
@@ -1791,10 +1877,6 @@ mc.on(
 
         }
 
-        // ----------------------------------------------
-        // ENVIRONMENT
-        // ----------------------------------------------
-
         else if (
           application.telemetryType ===
           'environmentMetrics'
@@ -1816,10 +1898,6 @@ mc.on(
           );
 
         }
-
-        // ----------------------------------------------
-        // OTHER TELEMETRY
-        // ----------------------------------------------
 
         else {
 
@@ -1866,6 +1944,9 @@ mc.on(
 
         serviceEnvelope:
           true,
+
+        topicType:
+          mqttTopicType,
 
         region:
           region.id,
@@ -1963,6 +2044,9 @@ mc.on(
         region.name,
 
       topic,
+
+      topicType:
+        mqttTopicType,
 
       receivedAt:
         new Date()
@@ -2278,6 +2362,17 @@ app.get(
 
       regionStats:
         getRegionStatsObject(),
+
+      mqttTransport: {
+        protobuf:
+          true,
+
+        json:
+          false,
+
+        map:
+          false
+      },
 
       decoders: {
 
