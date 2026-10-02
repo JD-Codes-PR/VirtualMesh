@@ -86,6 +86,7 @@ function broadcast(data) {
 
 const opts = {
 
+  // MQTT 3.1.1
   protocolVersion: 4,
 
   clientId:
@@ -292,9 +293,9 @@ mc.on(
 
     try {
 
-      // --------------------------------
+      // ==================================================
       // SERVICE ENVELOPE
-      // --------------------------------
+      // ==================================================
 
       const envelope =
         fromBinary(
@@ -321,9 +322,9 @@ mc.on(
       const packet =
         envelope.packet;
 
-      // --------------------------------
+      // ==================================================
       // MESH PACKET
-      // --------------------------------
+      // ==================================================
 
       if (!packet) {
 
@@ -337,9 +338,9 @@ mc.on(
           'MESH PACKET: OK'
         );
 
-        // --------------------------------
+        // ==================================================
         // NODE IDs
-        // --------------------------------
+        // ==================================================
 
         const fromHex =
           '!' +
@@ -397,16 +398,12 @@ mc.on(
           packet.hopStart
         );
 
-        // --------------------------------
-        // PAYLOAD DETECTION
-        // --------------------------------
+        // ==================================================
+        // PAYLOAD VARIANT
+        // ==================================================
 
-        const hasEncrypted =
-          packet.encrypted &&
-          packet.encrypted.length > 0;
-
-        const hasDecoded =
-          packet.decoded != null;
+        const variant =
+          packet.payloadVariant;
 
         let payloadType =
           'UNKNOWN';
@@ -417,21 +414,30 @@ mc.on(
         let decodedBytes =
           0;
 
-        // --------------------------------
-        // DECODED PAYLOAD
-        // --------------------------------
+        let encryptedBytes =
+          0;
 
-        if (hasDecoded) {
+        // ==================================================
+        // DECODED PAYLOAD
+        // ==================================================
+
+        if (
+          variant &&
+          variant.case === 'decoded'
+        ) {
 
           payloadType =
             'DECODED';
 
+          const data =
+            variant.value;
+
           portnum =
-            packet.decoded.portnum;
+            data.portnum;
 
           decodedBytes =
-            packet.decoded.payload
-              ? packet.decoded.payload.length
+            data.payload
+              ? data.payload.length
               : 0;
 
           console.log(
@@ -450,31 +456,37 @@ mc.on(
 
           console.log(
             'Want response:',
-            packet.decoded.wantResponse
+            data.wantResponse
           );
 
           console.log(
             'Request ID:',
-            packet.decoded.requestId
+            data.requestId
           );
 
           console.log(
             'Reply ID:',
-            packet.decoded.replyId
+            data.replyId
           );
 
         }
 
-        // --------------------------------
+        // ==================================================
         // ENCRYPTED PAYLOAD
-        // --------------------------------
+        // ==================================================
 
         else if (
-          hasEncrypted
+          variant &&
+          variant.case === 'encrypted'
         ) {
 
           payloadType =
             'ENCRYPTED';
+
+          encryptedBytes =
+            variant.value
+              ? variant.value.length
+              : 0;
 
           console.log(
             'Payload: ENCRYPTED'
@@ -482,14 +494,14 @@ mc.on(
 
           console.log(
             'Encrypted bytes:',
-            packet.encrypted.length
+            encryptedBytes
           );
 
         }
 
-        // --------------------------------
+        // ==================================================
         // UNKNOWN / EMPTY
-        // --------------------------------
+        // ==================================================
 
         else {
 
@@ -497,11 +509,17 @@ mc.on(
             'Payload: NONE / UNKNOWN'
           );
 
+          console.log(
+            'payloadVariant case:',
+            variant?.case ||
+              '(none)'
+          );
+
         }
 
-        // --------------------------------
-        // RESULT FOR WEB APP
-        // --------------------------------
+        // ==================================================
+        // STRUCTURED RESULT FOR WEB APP
+        // ==================================================
 
         result = {
 
@@ -550,10 +568,7 @@ mc.on(
 
           decodedBytes,
 
-          encryptedBytes:
-            hasEncrypted
-              ? packet.encrypted.length
-              : 0
+          encryptedBytes
 
         };
 
@@ -570,9 +585,9 @@ mc.on(
 
     }
 
-    // --------------------------------
-    // SEND TO BROWSER
-    // --------------------------------
+    // ==================================================
+    // SEND PACKET TO BROWSER
+    // ==================================================
 
     broadcast({
 
