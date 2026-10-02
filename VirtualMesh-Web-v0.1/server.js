@@ -607,11 +607,57 @@ function messageIdentity(from, packetId, text, to) {
     .digest('hex');
 }
 
+function validateTextMessage(text) {
+  if (typeof text !== 'string') return { valid: false, reason: 'NOT_STRING' };
+  if (!text.length) return { valid: false, reason: 'EMPTY' };
+  if (text.length > 4096) return { valid: false, reason: 'TOO_LONG' };
+
+  // U+FFFD means the original byte sequence was not valid UTF-8.
+  if (text.includes('\uFFFD')) return { valid: false, reason: 'INVALID_UTF8' };
+
+  let controls = 0;
+  let printable = 0;
+  let meaningful = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    const allowedWhitespace = ch === '\n' || ch === '\r' || ch === '\t';
+    const isControl = (cp < 0x20 && !allowedWhitespace) || (cp >= 0x7f && cp <= 0x9f);
+    if (isControl) controls++;
+    else printable++;
+    if (!isControl && !/\s/u.test(ch)) meaningful++;
+  }
+
+  if (controls > 0) return { valid: false, reason: 'CONTROL_CHARACTERS' };
+  if (meaningful === 0) return { valid: false, reason: 'NO_VISIBLE_TEXT' };
+  if (printable / Math.max(1, [...text].length) < 0.90) {
+    return { valid: false, reason: 'LOW_PRINTABLE_RATIO' };
+  }
+  return { valid: true, reason: 'OK' };
+}
+
+function nodeGeographyForMessage(from) {
+  const nodeHex = nodeIdToHex(from);
+  const node = uniqueNodes.get(nodeHex);
+  if (!node) return null;
+  return {
+    countryCode: node.countryCode ?? null,
+    country: node.country ?? null,
+    subdivisionCode: node.subdivisionCode ?? null,
+    subdivision: node.subdivision ?? null,
+    geoStatus: node.geoStatus ?? null,
+    latitude: node.latitude ?? node.position?.latitude ?? node.mapReport?.latitude ?? null,
+    longitude: node.longitude ?? node.position?.longitude ?? node.mapReport?.longitude ?? null
+  };
+}
+
 function recordMessageObservation({
   regionId, transport, topic, channelId, from, to, packetId,
   text, gatewayId, directed, pki = false, receivedAt = new Date().toISOString()
 }) {
-  if (typeof text !== 'string' || !text.length) return null;
+  const textValidation = validateTextMessage(text);
+  if (!textValidation.valid) {
+    return { isNew: false, rejected: true, reason: textValidation.reason, message: null };
+  }
 
   messageDedupStats.observations++;
   if (transport === 'protobuf') messageDedupStats.protobuf++;
@@ -647,6 +693,7 @@ function recordMessageObservation({
     pki: !!pki,
     channelId: channelId || null,
     text,
+    ...(nodeGeographyForMessage(from) || {}),
     firstSeen: receivedAt,
     lastSeen: receivedAt,
     mqttCopies: 1,
@@ -677,7 +724,7 @@ function getMessagesNewestFirst() {
 }
 
 // ======================================================
-// GEOGRAPHIC CORE v0.3
+// GEOGRAPHIC CORE v0.3.1
 // ======================================================
 
 // Lightweight offline geographic classification. This intentionally avoids
@@ -795,10 +842,33 @@ function classifyGeography(regionId, latitude, longitude) {
   return { countryCode: null, country: null, subdivisionCode: null, subdivision: null, geoStatus: 'UNKNOWN' };
 }
 
+function extractCoordinates(existing, changes) {
+  const candidates = [
+    changes,
+    changes?.position,
+    changes?.mapReport,
+    existing,
+    existing?.position,
+    existing?.mapReport
+  ];
+  for (const c of candidates) {
+    if (!c) continue;
+    const lat = Number(c.latitude);
+    const lon = Number(c.longitude);
+    if (Number.isFinite(lat) && Number.isFinite(lon) && !(lat === 0 && lon === 0)) {
+      return { latitude: lat, longitude: lon };
+    }
+  }
+  return { latitude: null, longitude: null };
+}
+
 function geographyFromChanges(regionId, existing, changes) {
-  const latitude = changes?.latitude ?? existing?.latitude;
-  const longitude = changes?.longitude ?? existing?.longitude;
-  return classifyGeography(regionId, latitude, longitude);
+  const { latitude, longitude } = extractCoordinates(existing, changes);
+  return {
+    ...classifyGeography(regionId, latitude, longitude),
+    latitude,
+    longitude
+  };
 }
 
 function isOperationalGeography(node) {
@@ -1321,7 +1391,7 @@ function inspectJsonPacket(region, topic, payload) {
           directed: jsonDirected,
           pki: isPkiJson
         });
-        plog('Normalized message:', recorded?.isNew ? 'NEW' : 'DUPLICATE');
+        plog('Normalized message:', recorded?.rejected ? `REJECTED (${recorded.reason})` : (recorded?.isNew ? 'NEW' : 'DUPLICATE'));
         plog('Message class:', isPkiJson ? 'PKI JSON MESSAGE' : (jsonDirected ? 'DIRECTED JSON MESSAGE' : 'PUBLIC JSON MESSAGE'));
       }
 
@@ -1911,14 +1981,15 @@ function handleMessage(topic, payload) {
 
         plog('');
         plog('===================================');
-        plog(normalizedMessage?.isNew ? 'TEXT MESSAGE RECEIVED' : 'DUPLICATE TEXT MESSAGE');
+        plog(normalizedMessage?.rejected ? 'INVALID TEXT CANDIDATE REJECTED' : (normalizedMessage?.isNew ? 'TEXT MESSAGE RECEIVED' : 'DUPLICATE TEXT MESSAGE'));
         plog('===================================');
         plog('Region:', region.id);
         plog('Channel ID:', envelope.channelId || '(none)');
         plog('From:', fromHex);
         plog('To:', isBroadcast ? 'BROADCAST' : toHex);
         plog('PortNum:', portnum, `(${portName})`);
-        plog('Message:', application.text);
+        if (normalizedMessage?.rejected) plog('Reject reason:', normalizedMessage.reason);
+        else plog('Message:', application.text);
         plog('Gateway:', envelope.gatewayId || '(none)');
         plog('===================================');
         plog('');
@@ -2391,11 +2462,18 @@ app.get('/api/nodes', (req, res) => {
 app.get('/api/messages', (req, res) => {
   const directed = String(req.query.directed || '').toLowerCase();
   const pki = String(req.query.pki || '').toLowerCase();
-  let messages = getMessagesNewestFirst();
+  const country = String(req.query.country || '').trim().toUpperCase();
+  const state = String(req.query.state || '').trim().toUpperCase();
+  let messages = getMessagesNewestFirst().map(m => ({
+    ...m,
+    ...(nodeGeographyForMessage(m.from) || {})
+  }));
   if (directed === 'true') messages = messages.filter(m => m.directed);
   if (directed === 'false') messages = messages.filter(m => !m.directed);
   if (pki === 'true') messages = messages.filter(m => m.pki);
   if (pki === 'false') messages = messages.filter(m => !m.pki);
+  if (country) messages = messages.filter(m => String(m.countryCode || '').toUpperCase() === country);
+  if (state) messages = messages.filter(m => String(m.subdivisionCode || '').toUpperCase() === state);
   res.json({
     service: 'VirtualMesh',
     mode: 'READ_ONLY',
@@ -2460,7 +2538,7 @@ app.get('/api/geography', (req, res) => {
   res.json({
     service: 'VirtualMesh',
     mode: 'READ_ONLY',
-    geographicCore: 'v0.3',
+    geographicCore: 'v0.3.1',
     spain,
     eu868UnknownOrOutsideSpain,
     usUnknown,
