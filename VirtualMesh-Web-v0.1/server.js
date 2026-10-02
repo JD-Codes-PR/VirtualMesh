@@ -142,6 +142,26 @@ let suppressedPackets = 0;
 let totalPackets = 0;
 const seenUnhandledPorts = new Set();
 let lastSummaryTotal = 0;
+let pktRetained = false;
+
+// No-payload breakdown (who sends them, from where, how old)
+const noPayloadByRegion = {};
+const noPayloadByGateway = new Map();
+const noPayloadByChannel = new Map();
+const noPayloadSamplesByRegion = {};
+let noPayloadOld = 0;
+let noPayloadRetained = 0;
+
+function bump(map, key) {
+  map.set(key, (map.get(key) || 0) + 1);
+}
+
+function topN(map, n = 5) {
+  return Array.from(map.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([k, v]) => `${k}=${v}`);
+}
 
 // Where do the packets go? (decoded / encrypted / no payload / no packet)
 const variantStats = {
@@ -1323,8 +1343,34 @@ function handleMessage(topic, payload) {
 
         variantStats.noPayload++;
 
-        if (variantStats.noPayload <= 5) {
+        const ageSeconds =
+          packet.rxTime
+            ? Math.round(Date.now() / 1000 - Number(packet.rxTime))
+            : null;
+
+        noPayloadByRegion[region.id] =
+          (noPayloadByRegion[region.id] || 0) + 1;
+
+        bump(noPayloadByGateway, envelope.gatewayId || '(none)');
+        bump(noPayloadByChannel, envelope.channelId || '(none)');
+
+        if (pktRetained) {
+          noPayloadRetained++;
+        }
+
+        // rx_time older than 1 day (or retained) = stale/replayed
+        if (ageSeconds !== null && ageSeconds > 86400) {
+          noPayloadOld++;
+        }
+
+        noPayloadSamplesByRegion[region.id] =
+          (noPayloadSamplesByRegion[region.id] || 0) + 1;
+
+        if (noPayloadSamplesByRegion[region.id] <= 3) {
           pktInteresting = true;
+          plog('SAMPLE NO-PAYLOAD [' + region.id + ']',
+            'retained=' + pktRetained,
+            'age_s=' + ageSeconds);
           plog('SAMPLE NO-PAYLOAD RAW HEX:', Buffer.from(payload).toString('hex'));
           plog('SAMPLE NO-PAYLOAD TOPIC:', topic);
           plog(
@@ -1644,7 +1690,9 @@ function handleMessage(topic, payload) {
 
 mc.on('message', (topic, payload, mqttPacket) => {
 
-  if (mqttPacket?.retain) {
+  pktRetained = !!mqttPacket?.retain;
+
+  if (pktRetained) {
     variantStats.retained++;
   }
 
@@ -1679,6 +1727,10 @@ setInterval(() => {
   console.log('New in last 60s:', totalPackets - lastSummaryTotal);
   lastSummaryTotal = totalPackets;
   console.log('Variants:', JSON.stringify(variantStats));
+  console.log('NoPayload by region:', JSON.stringify(noPayloadByRegion));
+  console.log('NoPayload top gateways:', JSON.stringify(topN(noPayloadByGateway)));
+  console.log('NoPayload top channels:', JSON.stringify(topN(noPayloadByChannel)));
+  console.log('NoPayload retained:', noPayloadRetained, '| rx_time older than 1 day:', noPayloadOld);
   console.log('Suppressed from log:', suppressedPackets);
   console.log('Observed nodes:', observedNodes.size);
   console.log('Nodes by region:', JSON.stringify(getNodeCountsByRegion()));
