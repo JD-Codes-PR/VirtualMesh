@@ -31,14 +31,11 @@ const MQTT_PASS = process.env.MQTT_PASS || '';
 // ======================================================
 
 const REGIONS = [
-  { id: 'PR', name: 'Puerto Rico', topic: 'msh/US/PR/#' },
-  { id: 'FL', name: 'Florida', topic: 'msh/US/FL/#' },
-  { id: 'TX', name: 'Texas', topic: 'msh/US/TX/#' },
-  // Spain uses the EU_868 radio region. This subscribes to the public EU_868 root;
-  // geographic Spain filtering can be applied from decoded position/map data.
-  { id: 'EU868', name: 'Spain / Europe (EU_868 public root)', topic: 'msh/EU_868/2/#' },
-  // Default root topic (gateways without a state sub-topic)
-  { id: 'US', name: 'United States (default root)', topic: 'msh/US/2/#' }
+  // One US root. Geographic state/territory is derived from decoded coordinates.
+  { id: 'US', name: 'United States / territories', topic: 'msh/US/2/#' },
+  // EU_868 is retained only as the transport source. Operational EU nodes are
+  // accepted only when their decoded coordinates can be classified as Spain.
+  { id: 'EU868', name: 'Spain via EU_868 public root', topic: 'msh/EU_868/2/#' }
 ];
 
 const TOPICS = REGIONS.map(region => region.topic);
@@ -680,6 +677,137 @@ function getMessagesNewestFirst() {
 }
 
 // ======================================================
+// GEOGRAPHIC CORE v0.3
+// ======================================================
+
+// Lightweight offline geographic classification. This intentionally avoids
+// network reverse-geocoding. State/territory labels are best-effort bounding
+// boxes; exact border decisions remain UNKNOWN rather than being guessed when
+// coordinates are absent. Spain includes mainland, Balearic and Canary Islands.
+const US_GEO_BOUNDS = [
+  ['PR','Puerto Rico',17.80,18.60,-67.35,-65.20],
+  ['VI','U.S. Virgin Islands',17.60,18.50,-65.20,-64.45],
+  ['GU','Guam',13.15,13.75,144.55,145.05],
+  ['MP','Northern Mariana Islands',14.00,20.70,144.70,146.30],
+  ['AS','American Samoa',-14.60,-10.90,-171.20,-168.00],
+  ['HI','Hawaii',18.80,22.30,-160.30,-154.70],
+  ['AK','Alaska',51.00,72.00,-180.00,-129.90],
+  ['FL','Florida',24.35,31.10,-87.70,-79.80],
+  ['TX','Texas',25.80,36.60,-106.70,-93.45],
+  ['CA','California',32.45,42.10,-124.55,-114.00],
+  ['OR','Oregon',41.90,46.35,-124.70,-116.35],
+  ['WA','Washington',45.50,49.10,-124.90,-116.80],
+  ['AZ','Arizona',31.25,37.10,-114.90,-109.00],
+  ['NM','New Mexico',31.25,37.10,-109.10,-103.00],
+  ['NV','Nevada',35.00,42.10,-120.10,-114.00],
+  ['UT','Utah',36.90,42.10,-114.10,-109.00],
+  ['CO','Colorado',36.90,41.10,-109.10,-102.00],
+  ['WY','Wyoming',40.90,45.10,-111.10,-104.00],
+  ['MT','Montana',44.30,49.10,-116.10,-104.00],
+  ['ID','Idaho',41.90,49.10,-117.30,-111.00],
+  ['ND','North Dakota',45.90,49.10,-104.10,-96.50],
+  ['SD','South Dakota',42.45,46.05,-104.10,-96.40],
+  ['NE','Nebraska',39.90,43.10,-104.10,-95.20],
+  ['KS','Kansas',36.90,40.10,-102.10,-94.55],
+  ['OK','Oklahoma',33.55,37.10,-103.10,-94.40],
+  ['MN','Minnesota',43.40,49.50,-97.30,-89.45],
+  ['IA','Iowa',40.30,43.60,-96.70,-90.10],
+  ['MO','Missouri',35.90,40.70,-95.80,-89.00],
+  ['AR','Arkansas',32.90,36.60,-94.70,-89.60],
+  ['LA','Louisiana',28.80,33.10,-94.10,-88.75],
+  ['WI','Wisconsin',42.45,47.35,-92.90,-86.70],
+  ['IL','Illinois',36.90,42.60,-91.60,-87.45],
+  ['MS','Mississippi',30.10,35.10,-91.70,-88.05],
+  ['MI','Michigan',41.65,48.35,-90.45,-82.10],
+  ['IN','Indiana',37.70,41.80,-88.10,-84.75],
+  ['KY','Kentucky',36.45,39.20,-89.60,-81.90],
+  ['TN','Tennessee',34.90,36.75,-90.35,-81.60],
+  ['AL','Alabama',30.10,35.10,-88.55,-84.85],
+  ['OH','Ohio',38.35,42.10,-84.85,-80.50],
+  ['WV','West Virginia',37.15,40.70,-82.70,-77.70],
+  ['VA','Virginia',36.45,39.55,-83.75,-75.15],
+  ['NC','North Carolina',33.75,36.70,-84.40,-75.35],
+  ['SC','South Carolina',32.00,35.25,-83.40,-78.45],
+  ['GA','Georgia',30.30,35.10,-85.70,-80.75],
+  ['PA','Pennsylvania',39.70,42.55,-80.60,-74.65],
+  ['NY','New York',40.45,45.10,-79.80,-71.75],
+  ['VT','Vermont',42.70,45.10,-73.50,-71.45],
+  ['NH','New Hampshire',42.65,45.35,-72.60,-70.60],
+  ['ME','Maine',42.95,47.50,-71.10,-66.85],
+  ['MA','Massachusetts',41.15,42.95,-73.55,-69.85],
+  ['RI','Rhode Island',41.10,42.05,-71.95,-71.10],
+  ['CT','Connecticut',40.95,42.10,-73.75,-71.75],
+  ['NJ','New Jersey',38.85,41.40,-75.60,-73.85],
+  ['DE','Delaware',38.40,39.90,-75.80,-74.95],
+  ['MD','Maryland',37.85,39.80,-79.50,-74.95],
+  ['DC','District of Columbia',38.78,39.00,-77.13,-76.90]
+];
+
+function inBox(lat, lon, minLat, maxLat, minLon, maxLon) {
+  return Number.isFinite(lat) && Number.isFinite(lon) &&
+    lat >= minLat && lat <= maxLat && lon >= minLon && lon <= maxLon;
+}
+
+function isSpainCoordinate(lat, lon) {
+  // Mainland
+  if (inBox(lat, lon, 35.70, 43.90, -9.55, 3.35)) return true;
+  // Balearic Islands
+  if (inBox(lat, lon, 38.55, 40.15, 1.00, 4.60)) return true;
+  // Canary Islands
+  if (inBox(lat, lon, 27.45, 29.55, -18.30, -13.20)) return true;
+  // Ceuta / Melilla
+  if (inBox(lat, lon, 35.15, 35.95, -6.10, -2.80)) return true;
+  return false;
+}
+
+function classifyGeography(regionId, latitude, longitude) {
+  const lat = Number(latitude);
+  const lon = Number(longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    return regionId === 'EU868'
+      ? { countryCode: null, country: null, subdivisionCode: null, subdivision: null, geoStatus: 'EU868_UNKNOWN' }
+      : { countryCode: 'US', country: 'United States', subdivisionCode: null, subdivision: null, geoStatus: 'US_UNKNOWN' };
+  }
+
+  if (regionId === 'EU868') {
+    if (isSpainCoordinate(lat, lon)) {
+      return { countryCode: 'ES', country: 'Spain', subdivisionCode: null, subdivision: null, geoStatus: 'SPAIN' };
+    }
+    return { countryCode: null, country: null, subdivisionCode: null, subdivision: null, geoStatus: 'NON_SPAIN_EU868' };
+  }
+
+  if (regionId === 'US') {
+    for (const [code, name, minLat, maxLat, minLon, maxLon] of US_GEO_BOUNDS) {
+      if (inBox(lat, lon, minLat, maxLat, minLon, maxLon)) {
+        const territory = ['PR','VI','GU','MP','AS'].includes(code);
+        return {
+          countryCode: code === 'PR' ? 'PR' : 'US',
+          country: code === 'PR' ? 'Puerto Rico' : 'United States',
+          subdivisionCode: code,
+          subdivision: name,
+          geoStatus: territory ? 'US_TERRITORY' : 'US_STATE'
+        };
+      }
+    }
+    return { countryCode: 'US', country: 'United States', subdivisionCode: null, subdivision: null, geoStatus: 'US_UNKNOWN' };
+  }
+
+  return { countryCode: null, country: null, subdivisionCode: null, subdivision: null, geoStatus: 'UNKNOWN' };
+}
+
+function geographyFromChanges(regionId, existing, changes) {
+  const latitude = changes?.latitude ?? existing?.latitude;
+  const longitude = changes?.longitude ?? existing?.longitude;
+  return classifyGeography(regionId, latitude, longitude);
+}
+
+function isOperationalGeography(node) {
+  if (!node) return false;
+  if (node.lastRegion === 'EU868' || node.region === 'EU868') return node.countryCode === 'ES';
+  return true;
+}
+
+// ======================================================
 // OBSERVED NODE
 // ======================================================
 
@@ -697,11 +825,15 @@ function updateObservedNode(regionId, nodeId, changes) {
       firstSeen: new Date().toISOString()
     };
 
+  const geography = geographyFromChanges(regionId, existing, changes);
+
   const updated = {
     ...existing,
     ...changes,
+    ...geography,
     region: regionId,
     nodeHex,
+    operational: regionId !== 'EU868' || geography.countryCode === 'ES',
     lastSeen: new Date().toISOString()
   };
 
@@ -719,13 +851,16 @@ function updateObservedNode(regionId, nodeId, changes) {
     ? [...globalExisting.regionsSeen]
     : [];
   if (!regionsSeen.includes(regionId)) regionsSeen.push(regionId);
+  const globalGeo = geographyFromChanges(regionId, globalExisting, changes);
   uniqueNodes.set(nodeHex, {
     ...globalExisting,
     ...changes,
+    ...globalGeo,
     nodeId: Number(nodeId),
     nodeHex,
     regionsSeen,
     lastRegion: regionId,
+    operational: regionId !== 'EU868' || globalGeo.countryCode === 'ES',
     lastSeen: updated.lastSeen
   });
 
@@ -2291,10 +2426,14 @@ app.get('/api/unique-nodes', (req, res) => {
 app.get('/api/live-nodes', (req, res) => {
   const now = Date.now();
   const liveWindowMs = LIVE_MAX_AGE_SECONDS * 1000;
-  const nodes = Array.from(uniqueNodes.values()).filter(node => {
+  let nodes = Array.from(uniqueNodes.values()).filter(node => {
     const t = Date.parse(node.lastSeen || node.updatedAt || node.lastHeard || '');
-    return Number.isFinite(t) && (now - t) <= liveWindowMs;
+    return Number.isFinite(t) && (now - t) <= liveWindowMs && isOperationalGeography(node);
   });
+  const country = String(req.query.country || '').trim().toUpperCase();
+  const state = String(req.query.state || '').trim().toUpperCase();
+  if (country) nodes = nodes.filter(node => String(node.countryCode || '').toUpperCase() === country);
+  if (state) nodes = nodes.filter(node => String(node.subdivisionCode || '').toUpperCase() === state);
 
   res.json({
     service: 'VirtualMesh',
@@ -2303,6 +2442,29 @@ app.get('/api/live-nodes', (req, res) => {
     count: nodes.length,
     temporalStats: { ...temporalStats },
     nodes
+  });
+});
+
+app.get('/api/geography', (req, res) => {
+  const nodes = Array.from(uniqueNodes.values());
+  const bySubdivision = {};
+  let spain = 0;
+  let eu868UnknownOrOutsideSpain = 0;
+  let usUnknown = 0;
+  for (const node of nodes) {
+    if (node.countryCode === 'ES') spain++;
+    if (node.lastRegion === 'EU868' && node.countryCode !== 'ES') eu868UnknownOrOutsideSpain++;
+    if (node.lastRegion === 'US' && !node.subdivisionCode) usUnknown++;
+    if (node.subdivisionCode) bySubdivision[node.subdivisionCode] = (bySubdivision[node.subdivisionCode] || 0) + 1;
+  }
+  res.json({
+    service: 'VirtualMesh',
+    mode: 'READ_ONLY',
+    geographicCore: 'v0.3',
+    spain,
+    eu868UnknownOrOutsideSpain,
+    usUnknown,
+    bySubdivision
   });
 });
 
@@ -2471,6 +2633,7 @@ server.listen(PORT, () => {
   console.log('Traffic analyzer endpoint: /api/traffic-analyzer');
   console.log('Normalized message inbox: /api/messages');
   console.log('Global unique nodes: /api/unique-nodes');
-  console.log('Live nodes (15 min): /api/live-nodes');
+  console.log('Live nodes (15 min): /api/live-nodes?country=ES or ?state=PR');
+  console.log('Geographic summary: /api/geography');
   console.log('Temporal stats: /api/temporal-stats');
 });
