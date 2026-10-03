@@ -33,6 +33,26 @@ const SPAIN_MQTT_USER = process.env.SPAIN_MQTT_USER || 'meshdev';
 const SPAIN_MQTT_PASS = process.env.SPAIN_MQTT_PASS || 'large4cats';
 const SPAIN_MQTT_TOPIC = process.env.SPAIN_MQTT_TOPIC || 'msh/EU_868/#';
 
+// O Zulo community MQTT source (Galicia / Spain), documented by Mesh Galicia.
+// Separate diagnostic source; packets are normalized into the SPAIN region.
+const OZULO_MQTT_URL = process.env.OZULO_MQTT_URL || 'mqtt://mqtt.mesh.comunidadeozulo.org:1883';
+const OZULO_MQTT_USER = process.env.OZULO_MQTT_USER || 'meshzulo';
+const OZULO_MQTT_PASS = process.env.OZULO_MQTT_PASS || 'zulo4ever';
+const OZULO_MQTT_TOPIC = process.env.OZULO_MQTT_TOPIC || 'msh/EU_868/#';
+
+const ozuloMqttDiag = {
+  state: 'initializing',
+  url: OZULO_MQTT_URL,
+  topic: OZULO_MQTT_TOPIC,
+  connectedAt: null,
+  lastPacketAt: null,
+  packets: 0,
+  reconnects: 0,
+  closes: 0,
+  lastError: null,
+  lastSuback: null
+};
+
 const spainMqttDiag = {
   state: 'initializing',
   url: SPAIN_MQTT_URL,
@@ -1560,6 +1580,17 @@ if (MQTT_PASS) {
   opts.password = MQTT_PASS;
 }
 
+const ozuloOpts = {
+  protocolVersion: 4,
+  clientId: `${CLIENT_ID}-oz`.slice(0, 60),
+  reconnectPeriod: 5000,
+  connectTimeout: 15000,
+  keepalive: 60,
+  clean: true,
+  username: OZULO_MQTT_USER,
+  password: OZULO_MQTT_PASS
+};
+
 const spainOpts = {
   protocolVersion: 4,
   clientId: `${CLIENT_ID}-es`.slice(0, 60),
@@ -1592,7 +1623,8 @@ for (const region of REGIONS) {
 console.log('Mode: READ ONLY');
 console.log('US global root: ENABLED');
 console.log('EU868 global root: ENABLED');
-console.log('Spain community broker: ENABLED (READ ONLY)');
+console.log('Spain direct broker: ENABLED (READ ONLY)');
+console.log('Spain O Zulo broker: ENABLED (READ ONLY)');
 console.log('Binary MQTT traffic: TRY SERVICE ENVELOPE');
 console.log('/2/map/ ServiceEnvelope attempt: ENABLED');
 console.log('Other binary ServiceEnvelope attempt: ENABLED');
@@ -1630,6 +1662,18 @@ console.log('[SPAIN] Mode: READ ONLY - publish DISABLED');
 console.log('===========================================');
 spainMqttDiag.state = 'connecting';
 const mcSpain = mqtt.connect(SPAIN_MQTT_URL, spainOpts);
+
+console.log('');
+console.log('========== O ZULO MQTT DIAGNOSTIC ==========');
+console.log('[OZULO] Connecting:', OZULO_MQTT_URL);
+console.log('[OZULO] Protocol: MQTT TCP / TLS disabled');
+console.log('[OZULO] Client ID:', ozuloOpts.clientId);
+console.log('[OZULO] Username:', OZULO_MQTT_USER);
+console.log('[OZULO] Topic:', OZULO_MQTT_TOPIC);
+console.log('[OZULO] Mode: READ ONLY - publish DISABLED');
+console.log('=============================================');
+ozuloMqttDiag.state = 'connecting';
+const mcOzulo = mqtt.connect(OZULO_MQTT_URL, ozuloOpts);
 
 // ======================================================
 // MQTT CONNECT
@@ -2429,6 +2473,89 @@ mc.on('message', (topic, payload, mqttPacket) => {
       suppressedPackets++;
     }
   }
+});
+
+// ======================================================
+// O ZULO COMMUNITY MQTT CLIENT - READ ONLY
+// ======================================================
+
+mcOzulo.on('connect', connack => {
+  ozuloMqttDiag.state = 'connected';
+  ozuloMqttDiag.connectedAt = new Date().toISOString();
+  ozuloMqttDiag.lastError = null;
+  console.log('');
+  console.log('[OZULO] MQTT CONNECTED');
+  console.log('[OZULO] CONNACK:', JSON.stringify(connack));
+  console.log('[OZULO] SUBSCRIBING TO:', OZULO_MQTT_TOPIC);
+  mcOzulo.subscribe(OZULO_MQTT_TOPIC, { qos: 0 }, (err, granted) => {
+    if (err) {
+      ozuloMqttDiag.lastError = `SUBSCRIBE: ${err.message}`;
+      console.error('[OZULO] SUBSCRIBE ERROR:', err.message);
+      return;
+    }
+    ozuloMqttDiag.lastSuback = granted;
+    console.log('[OZULO] SUBACK:', JSON.stringify(granted));
+  });
+});
+
+mcOzulo.on('message', (topic, payload, mqttPacket) => {
+  ozuloMqttDiag.packets++;
+  ozuloMqttDiag.lastPacketAt = new Date().toISOString();
+  if (ozuloMqttDiag.packets <= 5 || ozuloMqttDiag.packets % 100 === 0) {
+    console.log(`[OZULO] PACKET #${ozuloMqttDiag.packets}: ${topic} (${payload.length} bytes)`);
+  }
+  pktRetained = !!mqttPacket?.retain;
+  if (pktRetained) variantStats.retained++;
+  pktLog = [];
+  pktInteresting = false;
+  totalPackets++;
+  lastPacketAt = Date.now();
+  try {
+    // O Zulo is a Spanish community source; normalize into SPAIN while
+    // keeping independent source diagnostics above.
+    handleMessage(topic, payload, SPAIN_REGION);
+  } catch (err) {
+    console.error('OZULO HANDLER ERROR:', err.message);
+  } finally {
+    const buffered = pktLog;
+    pktLog = null;
+    if (VERBOSE || pktInteresting) {
+      for (const args of buffered) console.log(...args);
+    } else {
+      suppressedPackets++;
+    }
+  }
+});
+
+mcOzulo.on('reconnect', () => { ozuloMqttDiag.state = 'reconnecting'; ozuloMqttDiag.reconnects++; console.log('[OZULO] MQTT RECONNECTING'); });
+mcOzulo.on('offline', () => { ozuloMqttDiag.state = 'offline'; console.log('[OZULO] MQTT OFFLINE'); });
+mcOzulo.on('close', () => { ozuloMqttDiag.state = 'closed'; ozuloMqttDiag.closes++; console.log('[OZULO] MQTT CONNECTION CLOSED'); });
+mcOzulo.on('error', err => {
+  ozuloMqttDiag.state = 'error';
+  ozuloMqttDiag.lastError = err?.message || String(err);
+  console.error('[OZULO] MQTT ERROR:', ozuloMqttDiag.lastError);
+  if (err?.code) console.error('[OZULO] ERROR CODE:', err.code);
+});
+
+setInterval(() => {
+  console.log('[OZULO] STATUS:', JSON.stringify({
+    state: ozuloMqttDiag.state,
+    packets: ozuloMqttDiag.packets,
+    lastPacketAt: ozuloMqttDiag.lastPacketAt,
+    reconnects: ozuloMqttDiag.reconnects,
+    closes: ozuloMqttDiag.closes,
+    lastError: ozuloMqttDiag.lastError
+  }));
+}, 60000);
+
+app.get('/api/spain-ozulo-status', (req, res) => {
+  res.json({
+    service: 'VirtualMesh',
+    mode: 'READ_ONLY',
+    source: 'SPAIN_OZULO',
+    normalizedRegion: 'SPAIN',
+    ...ozuloMqttDiag
+  });
 });
 
 // ======================================================
