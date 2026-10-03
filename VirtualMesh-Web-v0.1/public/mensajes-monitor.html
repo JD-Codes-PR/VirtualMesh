@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="es" data-theme="dark">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VirtualMesh · Monitor privado de mensajes</title>
+<style>
+:root{--scale:1;--bg:#f4f7fb;--panel:#fff;--text:#132337;--muted:#687b91;--line:#dce5ef;--blue:#1674d1;--red:#d64242;--green:#12815c;--amber:#a66a00}
+html[data-theme=dark]{color-scheme:dark;--bg:#07111e;--panel:#0d1d31;--text:#eef6ff;--muted:#9fb1c7;--line:#263d59;--blue:#62b6ff;--red:#ff7777;--green:#61dda4;--amber:#ffc76a}
+*{box-sizing:border-box}html{font-size:calc(16px * var(--scale))}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}.wrap{max-width:1300px;margin:auto;padding:20px}.top{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}.title h1{margin:0;font-size:1.65rem}.title p{margin:.35rem 0 0;color:var(--muted)}.controls{display:flex;gap:8px;flex-wrap:wrap}button,select{border:1px solid var(--line);background:var(--panel);color:var(--text);border-radius:10px;padding:9px 12px;font:inherit;cursor:pointer}.tabs{display:flex;gap:8px;flex-wrap:wrap;margin:20px 0 12px}.tab.active{background:var(--blue);color:#fff;border-color:transparent}.stats{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.pill{border:1px solid var(--line);border-radius:999px;padding:6px 10px;color:var(--muted);font-size:.8rem}.pill.ok{color:var(--green)}.panel{background:var(--panel);border:1px solid var(--line);border-radius:18px;overflow:hidden}.msg{padding:15px 17px;border-top:1px solid var(--line)}.msg:first-child{border-top:0}.meta{display:flex;gap:8px;flex-wrap:wrap;align-items:center;color:var(--muted);font-size:.78rem;margin-bottom:7px}.tag{padding:3px 7px;border-radius:999px;border:1px solid var(--line)}.tag.pki{color:var(--red)}.tag.directed{color:var(--amber)}.tag.broadcast{color:var(--green)}.text{white-space:pre-wrap;word-break:break-word;line-height:1.5}.empty{padding:30px;color:var(--muted);text-align:center}.warning{margin:14px 0;padding:12px 14px;border:1px solid var(--line);border-radius:12px;color:var(--muted);font-size:.85rem}.footer{color:var(--muted);font-size:.78rem;text-align:center;padding:20px}.error{color:var(--red)}
+</style>
+</head><body><main class="wrap">
+<div class="top"><div class="title"><h1>VirtualMesh · Monitor privado de mensajes</h1><p>Vista de diagnóstico · Solo lectura · No destinada a publicación</p></div>
+<div class="controls"><button id="minus">A−</button><button id="reset">A</button><button id="plus">A+</button><button id="theme">☀️</button><select id="limit"><option>50</option><option selected>100</option><option>250</option><option>500</option></select><button id="refresh">Actualizar</button></div></div>
+<div class="warning"><strong>Diagnóstico:</strong> esta pantalla intenta mostrar todos los mensajes que el backend ya haya almacenado/decodificado, incluidos broadcast, dirigidos y PKI. Que un paquete PKI aparezca aquí no significa que VirtualMesh haya implementado por sí mismo descifrado X25519/PKI; puede haber llegado ya decodificado desde la fuente MQTT.</div>
+<nav class="tabs"><button class="tab active" data-region="ALL">Todos</button><button class="tab" data-region="US">US</button><button class="tab" data-region="PR">PR</button><button class="tab" data-region="EU">Europa / España</button></nav>
+<div class="stats"><span class="pill ok" id="mode">READ ONLY</span><span class="pill" id="count">0 mensajes</span><span class="pill" id="pki">0 PKI</span><span class="pill" id="directed">0 dirigidos</span><span class="pill" id="last">Sin actualizar</span></div>
+<section class="panel" id="list"><div class="empty">Cargando mensajes…</div></section>
+<div class="footer">VirtualMesh · herramienta privada de validación del decoder</div>
+</main>
+<script>
+const $=id=>document.getElementById(id), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let region='ALL', scale=+(localStorage.vmMonScale||1);
+function applyScale(){scale=Math.max(.85,Math.min(1.35,Math.round(scale*100)/100));document.documentElement.style.setProperty('--scale',scale);localStorage.vmMonScale=scale}
+$('minus').onclick=()=>{scale-=.1;applyScale()};$('plus').onclick=()=>{scale+=.1;applyScale()};$('reset').onclick=()=>{scale=1;applyScale()};applyScale();
+const root=document.documentElement;root.dataset.theme=localStorage.vmMonTheme||'dark';function themeIcon(){$('theme').textContent=root.dataset.theme==='dark'?'☀️':'🌙'}$('theme').onclick=()=>{root.dataset.theme=root.dataset.theme==='dark'?'light':'dark';localStorage.vmMonTheme=root.dataset.theme;themeIcon()};themeIcon();
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');region=b.dataset.region;load()});
+function isPR(m){return m.countryCode==='PR'||m.subdivisionCode==='PR'||m.geoStatus==='PR'||m.region==='PR'}
+function isEU(m){return m.region==='EU868'||m.countryCode==='ES'||m.country==='Spain'||m.geoStatus==='SPAIN'}
+function match(m){if(region==='ALL')return true;if(region==='PR')return isPR(m);if(region==='EU')return isEU(m);if(region==='US')return (m.region==='US'||m.countryCode==='US')&&!isPR(m);return false}
+function directed(m){return m.directed===true || (m.to && !['4294967295','0xffffffff','!ffffffff','BROADCAST'].includes(String(m.to)))}
+function pki(m){return m.pki===true || String(m.channelId||m.channel||'').toUpperCase()==='PKI'}
+function when(m){const v=m.lastSeen||m.receivedAt||m.timestamp||m.ts;return v?new Date(v).toLocaleString('es-PR'):'sin hora'}
+function render(arr){const a=arr.filter(match);$('count').textContent=`${a.length} mensajes`;$('pki').textContent=`${a.filter(pki).length} PKI`;$('directed').textContent=`${a.filter(directed).length} dirigidos`;$('list').innerHTML=a.length?a.map(m=>`<article class="msg"><div class="meta"><span>${esc(when(m))}</span><span class="tag">${esc(m.region||m.countryCode||'UNKNOWN')}</span><span class="tag">${esc(m.channelId||m.channel||'sin canal')}</span>${pki(m)?'<span class="tag pki">PKI</span>':''}${directed(m)?'<span class="tag directed">DIRIGIDO</span>':'<span class="tag broadcast">BROADCAST</span>'}<span>From: ${esc(m.fromHex||m.from||'?')}</span><span>To: ${esc(m.toHex||m.to||'?')}</span></div><div class="text">${esc(m.text||m.message||'')}</div></article>`).join(''):'<div class="empty">No hay mensajes almacenados para esta región.</div>';$('last').textContent='Actualizado '+new Date().toLocaleTimeString('es-PR')}
+async function load(){try{const lim=$('limit').value;const r=await fetch('/api/messages?limit='+encodeURIComponent(lim),{cache:'no-store'});if(!r.ok)throw new Error('HTTP '+r.status);const d=await r.json();const arr=Array.isArray(d)?d:(d.messages||[]);render(arr)}catch(e){$('list').innerHTML=`<div class="empty error">No se pudo leer /api/messages: ${esc(e.message)}</div>`}}
+$('refresh').onclick=load;$('limit').onchange=load;load();setInterval(load,10000);
+</script></body></html>
