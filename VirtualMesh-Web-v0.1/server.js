@@ -40,6 +40,18 @@ const OZULO_MQTT_USER = process.env.OZULO_MQTT_USER || 'meshzulo';
 const OZULO_MQTT_PASS = process.env.OZULO_MQTT_PASS || 'zulo4ever';
 const OZULO_MQTT_TOPIC = process.env.OZULO_MQTT_TOPIC || 'msh/EU_868/#';
 
+
+// Latin America community sources - READ ONLY
+const CHILE_MQTT_URL = process.env.CHILE_MQTT_URL || 'mqtt://mqtt.meshchile.cl:1883';
+const CHILE_MQTT_USER = process.env.CHILE_MQTT_USER || 'mshcl2025';
+const CHILE_MQTT_PASS = process.env.CHILE_MQTT_PASS || 'meshtastic.cl';
+const CHILE_MQTT_TOPIC = process.env.CHILE_MQTT_TOPIC || 'msh/CL/#';
+
+const COLOMBIA_MQTT_URL = process.env.COLOMBIA_MQTT_URL || 'mqtt://mqtt.meshcolombia.co:1883';
+const COLOMBIA_MQTT_USER = process.env.COLOMBIA_MQTT_USER || 'meshcousers';
+const COLOMBIA_MQTT_PASS = process.env.COLOMBIA_MQTT_PASS || 'meshcousers';
+const COLOMBIA_MQTT_TOPIC = process.env.COLOMBIA_MQTT_TOPIC || 'msh/CO/#';
+
 const ozuloMqttDiag = {
   state: 'initializing',
   url: OZULO_MQTT_URL,
@@ -72,18 +84,24 @@ const spainMqttDiag = {
 
 const REGIONS = [
   // One US root. Geographic state/territory is derived from decoded coordinates.
+  { id: 'PR', name: 'Puerto Rico priority root', topic: 'msh/US/PR/#' },
   { id: 'US', name: 'United States / territories', topic: 'msh/US/2/#' },
   // EU_868 is retained only as the transport source. Operational EU nodes are
   // accepted only when their decoded coordinates can be classified as Spain.
   { id: 'EU868', name: 'Europe via global EU_868 public root', topic: 'msh/EU_868/2/#' },
-  // Separate Spain community broker. Topic overlaps EU_868 by design, but source
-  // identity is supplied by the dedicated MQTT client so it remains SPAIN.
-  { id: 'SPAIN', name: 'Spain community MQTT', topic: SPAIN_MQTT_TOPIC, broker: 'mqtt.meshtastic.es' }
+  // ANZ is the regional root used by several Latin-American communities.
+  { id: 'ANZ', name: 'ANZ regional public root (Latin America discovery)', topic: 'msh/ANZ/#' },
+  { id: 'SPAIN', name: 'Spain community MQTT', topic: SPAIN_MQTT_TOPIC, broker: 'mqtt.meshtastic.es' },
+  { id: 'CHILE', name: 'MeshChile community MQTT', topic: CHILE_MQTT_TOPIC, broker: 'mqtt.meshchile.cl' },
+  { id: 'COLOMBIA', name: 'Meshtastic Colombia community MQTT', topic: COLOMBIA_MQTT_TOPIC, broker: 'mqtt.meshcolombia.co' }
 ];
 
-const GLOBAL_REGIONS = REGIONS.filter(region => region.id !== 'SPAIN');
+const DEDICATED_REGION_IDS = new Set(['SPAIN','CHILE','COLOMBIA']);
+const GLOBAL_REGIONS = REGIONS.filter(region => !DEDICATED_REGION_IDS.has(region.id));
 const TOPICS = GLOBAL_REGIONS.map(region => region.topic);
 const SPAIN_REGION = REGIONS.find(region => region.id === 'SPAIN');
+const CHILE_REGION = REGIONS.find(region => region.id === 'CHILE');
+const COLOMBIA_REGION = REGIONS.find(region => region.id === 'COLOMBIA');
 
 // ======================================================
 // LIVE CORE - TEMPORAL CLASSIFICATION
@@ -144,6 +162,28 @@ const LONGFAST_KEY = Buffer.from([
   0xf0, 0xbc, 0xff, 0xab,
   0xcf, 0x4e, 0x69, 0x01
 ]);
+
+// Public community channel keys discovered from community documentation.
+// AQ== maps to Meshtastic's standard public/default channel key (LONGFAST_KEY).
+const PUBLIC_CHANNEL_KEYS = new Map([
+  ['LONGFAST', LONGFAST_KEY],
+  ['SFNARROW', LONGFAST_KEY],
+  ['BAIRESMESH', Buffer.from('aB3K7ZIciBKq49nxn5gVmPQEtbTUVZOHKxuCaCKaHtA=', 'base64')],
+  ['ROSARIOMESH', Buffer.from('kss+4MMhc9unauU8i6bix0Lt/pkjWMv1PIFr0fH8g58=', 'base64')],
+  ['NQNMESH', Buffer.from('B7jYDJLWy9TSnajWI/yAJETLBcjN2RNXUU4jS4eRyJo=', 'base64')],
+  ['CORDOBAMESH', Buffer.from('CoRd0B4lHaBoN6OWT0u2EvNX9Jci7gsIiIJtD30BCCw=', 'base64')],
+  ['ERMESH', Buffer.from('w9nTAUTYp2eFo7KyCfo5a42YSM4ewfrV/PSoxcjrAPI=', 'base64')],
+  ['MENDOZAMESH', Buffer.from('yVyN1359YQb0S1LW2cslgMrXHbTkHnR1TSHYDa7VCCs=', 'base64')]
+]);
+
+function candidateChannelKeys(channelId) {
+  const name = String(channelId || '').trim().toUpperCase();
+  const out = [];
+  if (PUBLIC_CHANNEL_KEYS.has(name)) out.push({ name, key: PUBLIC_CHANNEL_KEYS.get(name) });
+  if (!out.some(x => x.key.equals(LONGFAST_KEY))) out.push({ name: 'PUBLIC_DEFAULT', key: LONGFAST_KEY });
+  return out;
+}
+
 
 // ======================================================
 // EXPRESS / WEBSOCKET
@@ -901,14 +941,46 @@ function isSpainCoordinate(lat, lon) {
   return false;
 }
 
+function classifyLatinAmericaCoordinate(lat, lon) {
+  // Country-level bounding boxes are intentionally conservative diagnostics,
+  // not political-border GIS. Dedicated country brokers override these.
+  if (inBox(lat, lon, 14.3, 32.8, -118.5, -86.5)) return {countryCode:'MX',country:'Mexico',geoStatus:'MEXICO'};
+  if (inBox(lat, lon, -55.2, -21.7, -73.7, -53.5)) return {countryCode:'AR',country:'Argentina',geoStatus:'ARGENTINA'};
+  if (inBox(lat, lon, -56.0, -17.3, -75.8, -66.0)) return {countryCode:'CL',country:'Chile',geoStatus:'CHILE'};
+  if (inBox(lat, lon, -4.5, 13.6, -79.2, -66.7)) return {countryCode:'CO',country:'Colombia',geoStatus:'COLOMBIA'};
+  if (inBox(lat, lon, 0.5, 12.8, -73.5, -59.5)) return {countryCode:'VE',country:'Venezuela',geoStatus:'VENEZUELA'};
+  if (inBox(lat, lon, -18.5, 0.0, -81.5, -68.5)) return {countryCode:'PE',country:'Peru',geoStatus:'PERU'};
+  if (inBox(lat, lon, -5.2, 1.8, -81.2, -75.0)) return {countryCode:'EC',country:'Ecuador',geoStatus:'ECUADOR'};
+  if (inBox(lat, lon, -23.0, -9.5, -69.7, -57.3)) return {countryCode:'BO',country:'Bolivia',geoStatus:'BOLIVIA'};
+  if (inBox(lat, lon, -27.7, -19.0, -62.8, -54.0)) return {countryCode:'PY',country:'Paraguay',geoStatus:'PARAGUAY'};
+  if (inBox(lat, lon, -35.2, -30.0, -58.7, -53.0)) return {countryCode:'UY',country:'Uruguay',geoStatus:'URUGUAY'};
+  if (inBox(lat, lon, 7.0, 10.0, -83.1, -77.0)) return {countryCode:'PA',country:'Panama',geoStatus:'PANAMA'};
+  if (inBox(lat, lon, 8.0, 11.3, -86.0, -82.4)) return {countryCode:'CR',country:'Costa Rica',geoStatus:'COSTA_RICA'};
+  if (inBox(lat, lon, 13.6, 17.9, -92.3, -88.0)) return {countryCode:'GT',country:'Guatemala',geoStatus:'GUATEMALA'};
+  if (inBox(lat, lon, 12.8, 16.6, -89.4, -83.0)) return {countryCode:'HN',country:'Honduras',geoStatus:'HONDURAS'};
+  if (inBox(lat, lon, 13.0, 14.5, -90.2, -87.6)) return {countryCode:'SV',country:'El Salvador',geoStatus:'EL_SALVADOR'};
+  if (inBox(lat, lon, 10.7, 15.1, -87.8, -82.5)) return {countryCode:'NI',country:'Nicaragua',geoStatus:'NICARAGUA'};
+  if (inBox(lat, lon, 17.4, 20.1, -72.1, -68.1)) return {countryCode:'DO',country:'Dominican Republic',geoStatus:'DOMINICAN_REPUBLIC'};
+  if (inBox(lat, lon, 19.5, 23.4, -85.0, -74.0)) return {countryCode:'CU',country:'Cuba',geoStatus:'CUBA'};
+  if (inBox(lat, lon, 0.8, 2.4, 9.2, 11.5)) return {countryCode:'GQ',country:'Equatorial Guinea',geoStatus:'EQUATORIAL_GUINEA'};
+  return null;
+}
+
 function classifyGeography(regionId, latitude, longitude) {
   const lat = Number(latitude);
   const lon = Number(longitude);
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    const fixed = {PR:['PR','Puerto Rico','PUERTO_RICO'],CHILE:['CL','Chile','CHILE'],COLOMBIA:['CO','Colombia','COLOMBIA'],SPAIN:['ES','Spain','SPAIN']};
+    if (fixed[regionId]) { const [countryCode,country,geoStatus]=fixed[regionId]; return {countryCode,country,subdivisionCode:null,subdivision:null,geoStatus}; }
     return regionId === 'EU868'
       ? { countryCode: null, country: null, subdivisionCode: null, subdivision: null, geoStatus: 'EU868_UNKNOWN' }
-      : { countryCode: 'US', country: 'United States', subdivisionCode: null, subdivision: null, geoStatus: 'US_UNKNOWN' };
+      : { countryCode: null, country: null, subdivisionCode: null, subdivision: null, geoStatus: `${regionId}_UNKNOWN` };
   }
+
+  if (regionId === 'PR') return { countryCode:'PR', country:'Puerto Rico', subdivisionCode:'PR', subdivision:'Puerto Rico', geoStatus:'PUERTO_RICO' };
+  if (regionId === 'CHILE') return { countryCode:'CL', country:'Chile', subdivisionCode:null, subdivision:null, geoStatus:'CHILE' };
+  if (regionId === 'COLOMBIA') return { countryCode:'CO', country:'Colombia', subdivisionCode:null, subdivision:null, geoStatus:'COLOMBIA' };
+  if (regionId === 'SPAIN') return { countryCode:'ES', country:'Spain', subdivisionCode:null, subdivision:null, geoStatus:'SPAIN' };
 
   if (regionId === 'EU868') {
     if (isSpainCoordinate(lat, lon)) {
@@ -918,6 +990,8 @@ function classifyGeography(regionId, latitude, longitude) {
   }
 
   if (regionId === 'US') {
+    const latin = classifyLatinAmericaCoordinate(lat, lon);
+    if (latin?.countryCode === 'MX') return { ...latin, subdivisionCode:null, subdivision:null };
     for (const [code, name, minLat, maxLat, minLon, maxLon] of US_GEO_BOUNDS) {
       if (inBox(lat, lon, minLat, maxLat, minLon, maxLon)) {
         const territory = ['PR','VI','GU','MP','AS'].includes(code);
@@ -931,6 +1005,12 @@ function classifyGeography(regionId, latitude, longitude) {
       }
     }
     return { countryCode: 'US', country: 'United States', subdivisionCode: null, subdivision: null, geoStatus: 'US_UNKNOWN' };
+  }
+
+  if (regionId === 'ANZ') {
+    const latin = classifyLatinAmericaCoordinate(lat, lon);
+    if (latin) return { ...latin, subdivisionCode:null, subdivision:null };
+    return { countryCode:null, country:null, subdivisionCode:null, subdivision:null, geoStatus:'ANZ_OUTSIDE_TARGETS' };
   }
 
   return { countryCode: null, country: null, subdivisionCode: null, subdivision: null, geoStatus: 'UNKNOWN' };
@@ -1178,27 +1258,14 @@ function getPublicKeyNodeCounts() {
 // successful decryption. Mesh.Data must also parse.
 // ======================================================
 
-function decryptWithLongFastKey(encrypted, packetId, fromNode) {
-
+function decryptWithChannelKey(encrypted, packetId, fromNode, key) {
   const nonce = Buffer.alloc(16);
-
   nonce.writeBigUInt64LE(BigInt(packetId), 0);
-
   nonce.writeUInt32LE(Number(fromNode) >>> 0, 8);
-
-  const decipher =
-    crypto.createDecipheriv(
-      'aes-128-ctr',
-      LONGFAST_KEY,
-      nonce
-    );
-
+  const algorithm = key.length === 32 ? 'aes-256-ctr' : 'aes-128-ctr';
+  const decipher = crypto.createDecipheriv(algorithm, key, nonce);
   decipher.setAutoPadding(false);
-
-  return Buffer.concat([
-    decipher.update(Buffer.from(encrypted)),
-    decipher.final()
-  ]);
+  return Buffer.concat([decipher.update(Buffer.from(encrypted)), decipher.final()]);
 }
 
 // ======================================================
@@ -1621,6 +1688,7 @@ for (const region of REGIONS) {
 }
 
 console.log('Mode: READ ONLY');
+console.log('Puerto Rico priority root msh/US/PR/#: ENABLED');
 console.log('US global root: ENABLED');
 console.log('EU868 global root: ENABLED');
 console.log('Spain direct broker: ENABLED (READ ONLY)');
@@ -1984,32 +2052,33 @@ function handleMessage(topic, payload, regionOverride = null) {
           'Decrypt attempt channel:',
           envelope.channelId || '(none)'
         );
-        plog('Trying public LongFast key...');
+        const keyCandidates = candidateChannelKeys(envelope.channelId);
+        plog('Trying public key candidates:', keyCandidates.map(x => x.name).join(', '));
 
         try {
-
-          const plaintext =
-            decryptWithLongFastKey(
-              variant.value,
-              packet.id,
-              packet.from
-            );
-
-          plog('AES-CTR transform: OK');
-          plog(
-            'Plaintext candidate bytes:',
-            plaintext.length
-          );
-
-          const data =
-            fromBinary(Mesh.DataSchema, plaintext);
-
-          // Random bytes can parse as a Data protobuf with portnum 0
-          // (UNKNOWN_APP). That is NOT a valid decryption.
-          if (data.portnum === 0) {
-            variantStats.portnum0Rejected++;
-            throw new Error('portnum 0 (UNKNOWN_APP): not a valid decrypt');
+          let plaintext = null;
+          let data = null;
+          let keyUsed = null;
+          let lastKeyError = null;
+          for (const candidate of keyCandidates) {
+            try {
+              const candidatePlaintext = decryptWithChannelKey(variant.value, packet.id, packet.from, candidate.key);
+              const candidateData = fromBinary(Mesh.DataSchema, candidatePlaintext);
+              if (candidateData.portnum === 0) throw new Error('portnum 0');
+              plaintext = candidatePlaintext;
+              data = candidateData;
+              keyUsed = candidate.name;
+              break;
+            } catch (e) { lastKeyError = e; }
           }
+          if (!data) {
+            variantStats.portnum0Rejected++;
+            throw new Error(`no public channel key produced valid Mesh.Data${lastKeyError ? ': '+lastKeyError.message : ''}`);
+          }
+
+          plog('AES-CTR decrypt candidate: OK');
+          plog('Public key used:', keyUsed);
+          plog('Plaintext candidate bytes:', plaintext.length);
 
           decryptionSuccess = true;
 
@@ -2476,6 +2545,30 @@ mc.on('message', (topic, payload, mqttPacket) => {
 });
 
 // ======================================================
+// LATIN AMERICA COMMUNITY MQTT CLIENTS - READ ONLY
+// ======================================================
+
+function createReadOnlyCommunityClient(label, url, username, password, topic, region) {
+  const diag = { state:'connecting', url, topic, connectedAt:null, lastPacketAt:null, packets:0, reconnects:0, closes:0, lastError:null, lastSuback:null };
+  const options = { protocolVersion:4, clientId:`${CLIENT_ID}-${label.toLowerCase()}`.slice(0,60), reconnectPeriod:5000, connectTimeout:15000, keepalive:60, clean:true, username, password };
+  console.log(`[${label}] Connecting:`, url);
+  console.log(`[${label}] Topic:`, topic);
+  console.log(`[${label}] Mode: READ ONLY - publish DISABLED`);
+  const client = mqtt.connect(url, options);
+  client.on('connect', connack => { diag.state='connected'; diag.connectedAt=new Date().toISOString(); diag.lastError=null; console.log(`[${label}] MQTT CONNECTED`); client.subscribe(topic,{qos:0},(err,granted)=>{ if(err){diag.lastError=`SUBSCRIBE: ${err.message}`; console.error(`[${label}] SUBSCRIBE ERROR:`,err.message);return;} diag.lastSuback=granted; console.log(`[${label}] SUBACK:`,JSON.stringify(granted)); }); });
+  client.on('message',(mqttTopic,payload,mqttPacket)=>{ diag.packets++; diag.lastPacketAt=new Date().toISOString(); if(diag.packets<=5||diag.packets%100===0) console.log(`[${label}] PACKET #${diag.packets}: ${mqttTopic} (${payload.length} bytes)`); pktRetained=!!mqttPacket?.retain; if(pktRetained)variantStats.retained++; pktLog=[]; pktInteresting=false; totalPackets++; lastPacketAt=Date.now(); try{handleMessage(mqttTopic,payload,region);}catch(err){console.error(`${label} HANDLER ERROR:`,err.message);}finally{const buffered=pktLog;pktLog=null;if(VERBOSE||pktInteresting){for(const args of buffered)console.log(...args);}else suppressedPackets++;} });
+  client.on('reconnect',()=>{diag.state='reconnecting';diag.reconnects++;}); client.on('offline',()=>{diag.state='offline';}); client.on('close',()=>{diag.state='closed';diag.closes++;}); client.on('error',err=>{diag.state='error';diag.lastError=err?.message||String(err);console.error(`[${label}] MQTT ERROR:`,diag.lastError);});
+  return {client,diag};
+}
+
+const chileSource = createReadOnlyCommunityClient('CHILE', CHILE_MQTT_URL, CHILE_MQTT_USER, CHILE_MQTT_PASS, CHILE_MQTT_TOPIC, CHILE_REGION);
+const colombiaSource = createReadOnlyCommunityClient('COLOMBIA', COLOMBIA_MQTT_URL, COLOMBIA_MQTT_USER, COLOMBIA_MQTT_PASS, COLOMBIA_MQTT_TOPIC, COLOMBIA_REGION);
+
+app.get('/api/hispanic-status', (req,res)=>res.json({service:'VirtualMesh Hispanic + US',mode:'READ_ONLY',version:'v0.6.0-hispanic-us',priority:{country:'Puerto Rico',topic:'msh/US/PR/#',verifiedPublicChannels:['LongFast'],discovery:'Any additional channel observed under PR root is recorded diagnostically, not pre-declared public.'},countries:['PR','US','ES','MX','AR','CL','CO','VE','PE','EC','BO','PY','UY','PA','CR','GT','HN','SV','NI','DO','CU','GQ'],spain:{direct:SPAIN_MQTT_TOPIC,ozulo:OZULO_MQTT_TOPIC},sources:{globalUS:'msh/US/2/#',puertoRico:'msh/US/PR/#',euSpain:'msh/EU_868/2/#',anzDiscovery:'msh/ANZ/#',chile:CHILE_MQTT_TOPIC,colombia:COLOMBIA_MQTT_TOPIC}}));
+
+app.get('/api/latin-america-status', (req,res)=>res.json({service:'VirtualMesh',mode:'READ_ONLY',version:'v0.5.5-latam',sources:{chile:chileSource.diag,colombia:colombiaSource.diag,mexico:{mode:'US_ROOT_GEO',topic:'msh/US/2/#'},argentina:{mode:'ANZ_ROOT_GEO',topic:'msh/ANZ/#',publicChannels:['BairesMesh','RosarioMesh','NQNmesh','CordobaMesh','ERMesh','MendozaMesh']},venezuela:{mode:'REGIONAL_ROOT_GEO',dedicatedPublicBroker:null}}}));
+
+// ======================================================
 // O ZULO COMMUNITY MQTT CLIENT - READ ONLY
 // ======================================================
 
@@ -2812,7 +2905,7 @@ function topologySummary() {
   return gateways;
 }
 
-app.get('/api/health', (req, res) => res.json({ service:'VirtualMesh', mode:'READ_ONLY', operationalCore:'v0.5.3-spain-diagnostic', ...operationalSnapshot() }));
+app.get('/api/health', (req, res) => res.json({ service:'VirtualMesh', mode:'READ_ONLY', operationalCore:'v0.5.5-latam', ...operationalSnapshot() }));
 
 app.get('/api/topology', (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 1000);
@@ -2965,7 +3058,7 @@ app.get('/api/geography', (req, res) => {
   res.json({
     service: 'VirtualMesh',
     mode: 'READ_ONLY',
-    geographicCore: 'v0.5.2-spain',
+    geographicCore: 'v0.5.5-latam',
     spain,
     eu868UnknownOrOutsideSpain,
     usUnknown,
@@ -3120,7 +3213,7 @@ app.get('/api/status', (req, res) => {
 
   res.json({
     service: 'VirtualMesh',
-    operationalCore: 'v0.5.2-spain',
+    operationalCore: 'v0.5.5-latam',
     mqttState,
     topics: TOPICS,
     regions: REGIONS,
