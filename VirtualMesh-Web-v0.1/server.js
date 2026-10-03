@@ -383,13 +383,34 @@ function getChannelDiscoveryObject() {
 }
 
 // ======================================================
-// CANDIDATE ANALYZER CORE - READ ONLY
-// Ranks OBSERVED/DISCOVERY channels for manual research only.
+// CANDIDATE ANALYZER CORE v2 - READ ONLY
+// Separates generic modem/preset-like traffic, special protocol traffic,
+// and named community candidates. Scores are research hints only.
 // A score NEVER promotes a channel to VERIFIED. Geography is not used.
 // ======================================================
 
+const PRESET_TRAFFIC_NAMES = new Set([
+  'LONGFAST','LONGSLOW','LONGMOD','LONGTURBO',
+  'MEDIUMFAST','MEDIUMSLOW',
+  'SHORTFAST','SHORTSLOW',
+  'SFNARROW','NARROWFAST','NARROWSLOW'
+]);
+
+const SPECIAL_TRAFFIC_NAMES = new Set([
+  'PKI','TELEMETRY','POSITION','NODEINFO','ROUTING','TRACEROUTE',
+  'STORE_FORWARD','NEIGHBORINFO','MAP_REPORT'
+]);
+
+function candidateTrafficType(row) {
+  const ch = String(row?.channelId || '').trim().toUpperCase();
+  if (SPECIAL_TRAFFIC_NAMES.has(ch)) return 'SPECIAL_TRAFFIC';
+  if (PRESET_TRAFFIC_NAMES.has(ch)) return 'PRESET_TRAFFIC';
+  return 'COMMUNITY_CANDIDATE';
+}
+
 function analyzeChannelCandidate(row) {
   const status = row?.classification?.status || 'DISCOVERY';
+  const trafficType = candidateTrafficType(row);
   const packets = Math.max(0, Number(row?.packets || 0));
   const textMessages = Math.max(0, Number(row?.textMessages || 0));
   const uniqueNodes = Math.max(0, Number(row?.uniqueNodes || 0));
@@ -399,35 +420,48 @@ function analyzeChannelCandidate(row) {
     ? Math.max(0, Math.round((last - first) / 60000))
     : 0;
 
+  // Special traffic is diagnostic only. It must never compete with public
+  // community-channel candidates (notably PKI).
+  if (trafficType === 'SPECIAL_TRAFFIC') {
+    return {
+      trafficType,
+      score: null,
+      priority: 'EXCLUDED',
+      spanMinutes,
+      reasons: ['special protocol/diagnostic traffic'],
+      recommendation: 'DIAGNOSTIC_ONLY',
+      eligibleForCommunityRanking: false
+    };
+  }
+
   let score = 0;
   const reasons = [];
 
-  // Strongest signal: actual decoded text activity.
   if (textMessages >= 5) { score += 35; reasons.push('5+ decoded text messages'); }
   else if (textMessages >= 2) { score += 28; reasons.push('2+ decoded text messages'); }
   else if (textMessages === 1) { score += 20; reasons.push('decoded text message observed'); }
 
-  // Community-like activity should involve more than one node.
   if (uniqueNodes >= 20) { score += 25; reasons.push('20+ unique nodes'); }
   else if (uniqueNodes >= 5) { score += 20; reasons.push('5+ unique nodes'); }
   else if (uniqueNodes >= 2) { score += 12; reasons.push('multiple unique nodes'); }
   else if (uniqueNodes === 1) { score += 3; reasons.push('single node only'); }
 
-  // Sustained packet activity. Logarithmic-ish buckets prevent flood volume dominating.
   if (packets >= 100) { score += 20; reasons.push('100+ packets observed'); }
   else if (packets >= 25) { score += 16; reasons.push('25+ packets observed'); }
   else if (packets >= 10) { score += 12; reasons.push('10+ packets observed'); }
   else if (packets >= 3) { score += 7; reasons.push('3+ packets observed'); }
   else if (packets >= 1) { score += 2; reasons.push('packet observed'); }
 
-  // Recurrence during the current server lifetime.
   if (spanMinutes >= 360) { score += 15; reasons.push('active across 6+ hours'); }
   else if (spanMinutes >= 60) { score += 12; reasons.push('active across 1+ hour'); }
   else if (spanMinutes >= 15) { score += 8; reasons.push('active across 15+ minutes'); }
   else if (spanMinutes >= 3) { score += 4; reasons.push('repeated across 3+ minutes'); }
 
-  // Dedicated Spanish community source is useful evidence, but still not verification.
   if (status === 'OBSERVED') { score += 5; reasons.push('dedicated community MQTT source observed'); }
+
+  // Generic preset-like names remain useful for network diagnostics, but are
+  // deliberately separated from named community candidates.
+  if (trafficType === 'PRESET_TRAFFIC') reasons.push('generic preset/modem-like channel name');
 
   score = Math.min(100, score);
   let priority = 'LOW';
@@ -435,15 +469,19 @@ function analyzeChannelCandidate(row) {
   else if (score >= 45) priority = 'MEDIUM';
 
   return {
+    trafficType,
     score,
     priority,
     spanMinutes,
     reasons,
-    recommendation: priority === 'HIGH'
-      ? 'RESEARCH_NOW'
-      : priority === 'MEDIUM'
-        ? 'RESEARCH_WHEN_PRACTICAL'
-        : 'KEEP_OBSERVING'
+    recommendation: trafficType === 'PRESET_TRAFFIC'
+      ? 'NETWORK_TRAFFIC_RESEARCH'
+      : priority === 'HIGH'
+        ? 'RESEARCH_NOW'
+        : priority === 'MEDIUM'
+          ? 'RESEARCH_WHEN_PRACTICAL'
+          : 'KEEP_OBSERVING',
+    eligibleForCommunityRanking: trafficType === 'COMMUNITY_CANDIDATE'
   };
 }
 
@@ -451,12 +489,14 @@ function getChannelCandidates() {
   return getChannelDiscoveryObject()
     .filter(row => ['DISCOVERY','OBSERVED'].includes(row.classification?.status || 'DISCOVERY'))
     .map(row => ({ ...row, candidate: analyzeChannelCandidate(row) }))
-    .sort((a,b) =>
-      b.candidate.score - a.candidate.score ||
-      b.textMessages - a.textMessages ||
-      b.uniqueNodes - a.uniqueNodes ||
-      b.packets - a.packets
-    );
+    .sort((a,b) => {
+      const typeRank = { COMMUNITY_CANDIDATE: 0, PRESET_TRAFFIC: 1, SPECIAL_TRAFFIC: 2 };
+      const ar = typeRank[a.candidate.trafficType] ?? 9;
+      const br = typeRank[b.candidate.trafficType] ?? 9;
+      if (ar !== br) return ar - br;
+      return (Number(b.candidate.score) || 0) - (Number(a.candidate.score) || 0) ||
+        b.textMessages - a.textMessages || b.uniqueNodes - a.uniqueNodes || b.packets - a.packets;
+    });
 }
 
 const jsonStats = {
@@ -3380,40 +3420,50 @@ app.get('/api/channel-discovery', (req, res) => {
 app.get('/api/channel-candidates', (req, res) => {
   const source = req.query.source ? String(req.query.source).toUpperCase() : null;
   const priority = req.query.priority ? String(req.query.priority).toUpperCase() : null;
+  const type = req.query.type ? String(req.query.type).toUpperCase() : null;
   const minScoreRaw = Number(req.query.minScore ?? 0);
   const minScore = Number.isFinite(minScoreRaw) ? Math.max(0, Math.min(100, minScoreRaw)) : 0;
   const limitRaw = Number(req.query.limit ?? 100);
   const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, Math.floor(limitRaw))) : 100;
 
-  let candidates = getChannelCandidates();
+  const all = getChannelCandidates();
+  let candidates = all;
   if (source) candidates = candidates.filter(r => String(r.source).toUpperCase() === source || String(r.regionId).toUpperCase() === source);
   if (priority) candidates = candidates.filter(r => r.candidate.priority === priority);
-  candidates = candidates.filter(r => r.candidate.score >= minScore).slice(0, limit);
+  if (type) candidates = candidates.filter(r => r.candidate.trafficType === type);
+  candidates = candidates.filter(r => r.candidate.score === null || r.candidate.score >= minScore).slice(0, limit);
 
-  const all = getChannelCandidates();
-  const priorityCounts = { HIGH: 0, MEDIUM: 0, LOW: 0 };
-  for (const row of all) priorityCounts[row.candidate.priority]++;
+  const priorityCounts = { HIGH: 0, MEDIUM: 0, LOW: 0, EXCLUDED: 0 };
+  const typeCounts = { COMMUNITY_CANDIDATE: 0, PRESET_TRAFFIC: 0, SPECIAL_TRAFFIC: 0 };
+  for (const row of all) {
+    priorityCounts[row.candidate.priority] = (priorityCounts[row.candidate.priority] || 0) + 1;
+    typeCounts[row.candidate.trafficType] = (typeCounts[row.candidate.trafficType] || 0) + 1;
+  }
 
   res.json({
     service: 'VirtualMesh',
     mode: 'READ_ONLY',
-    core: 'CANDIDATE_ANALYZER',
+    core: 'CANDIDATE_ANALYZER_V2',
     purpose: 'RESEARCH_PRIORITIZATION_ONLY',
     automaticPromotion: false,
     geographyUsed: false,
-    scoring: {
-      decodedText: '0-35',
-      uniqueNodes: '0-25',
-      packetActivity: '0-20',
-      recurrenceCurrentRuntime: '0-15',
-      dedicatedObservedSource: '0-5',
-      high: '70-100',
-      medium: '45-69',
-      low: '0-44'
+    categories: {
+      COMMUNITY_CANDIDATE: 'named channel eligible for community research ranking',
+      PRESET_TRAFFIC: 'generic preset/modem-like traffic; kept separate from community ranking',
+      SPECIAL_TRAFFIC: 'protocol/diagnostic traffic; excluded from candidate scoring'
     },
-    filters: { source, priority, minScore, limit },
+    scoring: {
+      appliesTo: ['COMMUNITY_CANDIDATE','PRESET_TRAFFIC'],
+      excluded: ['SPECIAL_TRAFFIC'],
+      decodedText: '0-35', uniqueNodes: '0-25', packetActivity: '0-20',
+      recurrenceCurrentRuntime: '0-15', dedicatedObservedSource: '0-5',
+      high: '70-100', medium: '45-69', low: '0-44'
+    },
+    filters: { source, priority, type, minScore, limit },
     totalCandidates: all.length,
     priorityCounts,
+    typeCounts,
+    communityRanking: all.filter(r => r.candidate.eligibleForCommunityRanking).slice(0, 25),
     count: candidates.length,
     candidates
   });
@@ -3563,7 +3613,7 @@ server.listen(PORT, () => {
   console.log('MQTT publish: DISABLED');
   console.log('Diagnostics endpoint: /api/diagnostics');
   console.log('Traffic analyzer endpoint: /api/traffic-analyzer');
-  console.log('Channel candidate analyzer: /api/channel-candidates');
+  console.log('Channel candidate analyzer v2: /api/channel-candidates');
   console.log('Normalized message inbox: /api/messages');
   console.log('Global unique nodes: /api/unique-nodes');
   console.log('Live nodes (15 min): /api/live-nodes?country=ES or ?state=PR');
