@@ -282,6 +282,59 @@ const regionStats = new Map();
 
 const channelDiscovery = new Map();
 
+
+// ======================================================
+// CHANNEL CORROBORATION REGISTRY
+// The monitor must never infer a community from coordinates.
+// Classification uses only the MQTT source/root + channelId.
+// ======================================================
+
+const VERIFIED_CHANNEL_RULES = [
+  { source: 'PR', channels: ['LONGFAST'], community: 'Puerto Rico', countryCode: 'PR', status: 'VERIFIED' },
+  { source: 'CHILE', channels: ['LONGFAST'], community: 'Chile', countryCode: 'CL', status: 'VERIFIED' },
+  { source: 'COLOMBIA', channels: ['LONGFAST'], community: 'Colombia', countryCode: 'CO', status: 'VERIFIED' },
+  // Argentina: published regional community channels. They are promoted only
+  // when the channel name itself is observed; ANZ alone is never Argentina.
+  { source: 'ANZ', channels: ['BAIRESMESH','ROSARIOMESH','NQNMESH','CORDOBAMESH','ERMESH','MENDOZAMESH'], community: 'Argentina', countryCode: 'AR', status: 'VERIFIED' },
+  // Spain: documented community channel names. O Zulo is a Spanish source,
+  // but an unknown channel on that broker remains OBSERVED until corroborated.
+  { source: 'SPAIN_OZULO', channels: ['SFNARROW','MADRID','BARCELONA','VALENCIA','CADIZ','LARIOJA','TEST','BOTS','IBERIA','GALICIA','ACORUÑA','ACORUNA','LUGO','OURENSE','PONTEVEDRA'], community: 'España', countryCode: 'ES', status: 'VERIFIED' },
+  { source: 'SPAIN', channels: ['SFNARROW','MADRID','BARCELONA','VALENCIA','CADIZ','LARIOJA','TEST','BOTS','IBERIA','GALICIA','ACORUÑA','ACORUNA','LUGO','OURENSE','PONTEVEDRA'], community: 'España', countryCode: 'ES', status: 'VERIFIED' }
+];
+
+function classifyObservedChannel(source, regionId, channelId) {
+  const src = String(source || regionId || 'UNKNOWN').trim().toUpperCase();
+  const ch = String(channelId || '(none)').trim();
+  const chUpper = ch.toUpperCase();
+  const rule = VERIFIED_CHANNEL_RULES.find(r => r.source === src && r.channels.includes(chUpper));
+  if (rule) return { status: rule.status, community: rule.community, countryCode: rule.countryCode, evidence: 'MQTT_SOURCE_PLUS_CHANNEL_ID' };
+
+  // The US public root is intentionally retained as a verified source/root,
+  // while individual community channel names are not automatically endorsed.
+  if (src === 'US') return { status: 'VERIFIED_SOURCE', community: 'United States', countryCode: 'US', evidence: 'MQTT_SOURCE_ROOT' };
+
+  if (src === 'SPAIN_OZULO' || src === 'SPAIN') {
+    return { status: 'OBSERVED', community: 'España (fuente observada)', countryCode: 'ES', evidence: 'MQTT_SOURCE_ONLY' };
+  }
+
+  return { status: 'DISCOVERY', community: null, countryCode: null, evidence: 'OBSERVED_ONLY' };
+}
+
+
+function classifyMessageChannel(message) {
+  const sources = Array.isArray(message?.sourcesSeen) && message.sourcesSeen.length
+    ? message.sourcesSeen
+    : [message?.source || message?.region || 'UNKNOWN'];
+  const rank = { VERIFIED: 4, VERIFIED_SOURCE: 3, OBSERVED: 2, DISCOVERY: 1 };
+  let best = null;
+  for (const src of sources) {
+    const c = classifyObservedChannel(src, message?.region, message?.channelId);
+    const candidate = { ...c, source: src };
+    if (!best || (rank[c.status] || 0) > (rank[best.status] || 0)) best = candidate;
+  }
+  return best || { status: 'DISCOVERY', community: null, countryCode: null, evidence: 'OBSERVED_ONLY', source: 'UNKNOWN' };
+}
+
 function observeChannelDiscovery({ source, regionId, channelId, from, isText = false }) {
   const src = String(source || regionId || 'UNKNOWN').trim() || 'UNKNOWN';
   const channel = String(channelId || '(none)').trim() || '(none)';
@@ -318,7 +371,8 @@ function getChannelDiscoveryObject() {
       textMessages: row.textMessages,
       uniqueNodes: row.nodes.size,
       firstSeen: row.firstSeen,
-      lastSeen: row.lastSeen
+      lastSeen: row.lastSeen,
+      classification: classifyObservedChannel(row.source, row.regionId, row.channelId)
     }))
     .sort((a,b) => b.packets - a.packets || a.source.localeCompare(b.source) || a.channelId.localeCompare(b.channelId));
 }
@@ -822,7 +876,7 @@ function nodeGeographyForMessage(from) {
 }
 
 function recordMessageObservation({
-  regionId, transport, topic, channelId, from, to, packetId,
+  regionId, source, transport, topic, channelId, from, to, packetId,
   text, gatewayId, directed, pki = false, receivedAt = new Date().toISOString()
 }) {
   const textValidation = validateTextMessage(text);
@@ -847,6 +901,8 @@ function recordMessageObservation({
     existing.mqttCopies++;
     if (gateway && !existing.gateways.includes(gateway)) existing.gateways.push(gateway);
     if (regionId && !existing.regionsSeen.includes(regionId)) existing.regionsSeen.push(regionId);
+    if (source && !existing.sourcesSeen.includes(source)) existing.sourcesSeen.push(source);
+    existing.source ||= source || regionId || null;
     if (transport && !existing.transports.includes(transport)) existing.transports.push(transport);
     if (topic && !existing.topics.includes(topic) && existing.topics.length < 12) existing.topics.push(topic);
     existing.pki = existing.pki || pki;
@@ -870,6 +926,7 @@ function recordMessageObservation({
     broadcast: !isDirected,
     pki: !!pki,
     region: regionId || null,
+    source: source || regionId || null,
     channelId: channelId || null,
     text,
     ...(nodeGeographyForMessage(from) || {}),
@@ -878,6 +935,7 @@ function recordMessageObservation({
     mqttCopies: 1,
     gateways: gateway ? [gateway] : [],
     regionsSeen: regionId ? [regionId] : [],
+    sourcesSeen: (source || regionId) ? [source || regionId] : [],
     transports: transport ? [transport] : [],
     topics: topic ? [topic] : []
   };
@@ -1618,6 +1676,7 @@ function inspectJsonPacket(region, topic, payload) {
       if (jsonText) {
         const recorded = recordMessageObservation({
           regionId: region.id,
+          source: region.id,
           transport: 'json',
           topic,
           channelId: jsonChannel,
@@ -2267,6 +2326,7 @@ function handleMessage(topic, payload, regionOverride = null, sourceOverride = n
 
         const normalizedMessage = recordMessageObservation({
           regionId: region.id,
+          source: discoverySource,
           transport: 'protobuf',
           topic,
           channelId: envelope.channelId || null,
@@ -3043,7 +3103,8 @@ app.get('/api/messages', (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || MESSAGE_INBOX_MAX), 1), MESSAGE_INBOX_MAX);
   let messages = getMessagesNewestFirst().map(m => ({
     ...m,
-    ...(nodeGeographyForMessage(m.from) || {})
+    ...(nodeGeographyForMessage(m.from) || {}),
+    channelClassification: classifyMessageChannel(m)
   }));
   if (directed === 'true') messages = messages.filter(m => m.directed);
   if (directed === 'false') messages = messages.filter(m => !m.directed);
@@ -3230,6 +3291,25 @@ app.get('/api/channel-discovery', (req, res) => {
     geographyUsedForCorroboration: false,
     count: rows.length,
     channels: rows
+  });
+});
+
+
+app.get('/api/channel-classification', (req, res) => {
+  const rows = getChannelDiscoveryObject();
+  const groups = { VERIFIED: [], VERIFIED_SOURCE: [], OBSERVED: [], DISCOVERY: [] };
+  for (const row of rows) {
+    const status = row.classification?.status || 'DISCOVERY';
+    (groups[status] ||= []).push(row);
+  }
+  res.json({
+    service: 'VirtualMesh',
+    mode: 'READ_ONLY',
+    core: 'CHANNEL_CORROBORATION',
+    policy: 'NO_GEOLOCATION_FOR_COMMUNITY_CORROBORATION',
+    verifiedRules: VERIFIED_CHANNEL_RULES.map(r => ({ source: r.source, channels: r.channels, community: r.community, countryCode: r.countryCode })),
+    counts: Object.fromEntries(Object.entries(groups).map(([k,v]) => [k, v.length])),
+    groups
   });
 });
 
