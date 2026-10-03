@@ -309,9 +309,14 @@ function classifyObservedChannel(source, regionId, channelId) {
   const rule = VERIFIED_CHANNEL_RULES.find(r => r.source === src && r.channels.includes(chUpper));
   if (rule) return { status: rule.status, community: rule.community, countryCode: rule.countryCode, evidence: 'MQTT_SOURCE_PLUS_CHANNEL_ID' };
 
-  // The US public root is intentionally retained as a verified source/root,
-  // while individual community channel names are not automatically endorsed.
-  if (src === 'US') return { status: 'VERIFIED_SOURCE', community: 'United States', countryCode: 'US', evidence: 'MQTT_SOURCE_ROOT' };
+  // US root policy (strict): the root itself is useful evidence, but it is not
+  // sufficient to attribute arbitrary observed channel names to a US community.
+  // Only LongFast is admitted to the corroborated monitor as a verified source/root.
+  // Every other channel observed on msh/US/2/# remains DISCOVERY until separately
+  // corroborated. Geography is intentionally not consulted here.
+  if (src === 'US' && chUpper === 'LONGFAST') {
+    return { status: 'VERIFIED_SOURCE', community: 'US public root', countryCode: 'US', evidence: 'MQTT_SOURCE_ROOT_PLUS_LONGFAST' };
+  }
 
   if (src === 'SPAIN_OZULO' || src === 'SPAIN') {
     return { status: 'OBSERVED', community: 'España (fuente observada)', countryCode: 'ES', evidence: 'MQTT_SOURCE_ONLY' };
