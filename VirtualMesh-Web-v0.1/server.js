@@ -26,6 +26,13 @@ const MQTT_URL =
 const MQTT_USER = process.env.MQTT_USER || '';
 const MQTT_PASS = process.env.MQTT_PASS || '';
 
+// Spain community MQTT source (official community infrastructure).
+// TLS is disabled by the community configuration, so the default uses mqtt://:1883.
+const SPAIN_MQTT_URL = process.env.SPAIN_MQTT_URL || 'mqtt://mqtt.meshtastic.es:1883';
+const SPAIN_MQTT_USER = process.env.SPAIN_MQTT_USER || 'meshdev';
+const SPAIN_MQTT_PASS = process.env.SPAIN_MQTT_PASS || 'large4cats';
+const SPAIN_MQTT_TOPIC = process.env.SPAIN_MQTT_TOPIC || 'msh/EU_868/#';
+
 // ======================================================
 // REGIONS
 // ======================================================
@@ -35,10 +42,15 @@ const REGIONS = [
   { id: 'US', name: 'United States / territories', topic: 'msh/US/2/#' },
   // EU_868 is retained only as the transport source. Operational EU nodes are
   // accepted only when their decoded coordinates can be classified as Spain.
-  { id: 'EU868', name: 'Spain via EU_868 public root', topic: 'msh/EU_868/2/#' }
+  { id: 'EU868', name: 'Europe via global EU_868 public root', topic: 'msh/EU_868/2/#' },
+  // Separate Spain community broker. Topic overlaps EU_868 by design, but source
+  // identity is supplied by the dedicated MQTT client so it remains SPAIN.
+  { id: 'SPAIN', name: 'Spain community MQTT', topic: SPAIN_MQTT_TOPIC, broker: 'mqtt.meshtastic.es' }
 ];
 
-const TOPICS = REGIONS.map(region => region.topic);
+const GLOBAL_REGIONS = REGIONS.filter(region => region.id !== 'SPAIN');
+const TOPICS = GLOBAL_REGIONS.map(region => region.topic);
+const SPAIN_REGION = REGIONS.find(region => region.id === 'SPAIN');
 
 // ======================================================
 // LIVE CORE - TEMPORAL CLASSIFICATION
@@ -1535,6 +1547,17 @@ if (MQTT_PASS) {
   opts.password = MQTT_PASS;
 }
 
+const spainOpts = {
+  protocolVersion: 4,
+  clientId: `${CLIENT_ID}-es`.slice(0, 60),
+  reconnectPeriod: 5000,
+  connectTimeout: 15000,
+  keepalive: 60,
+  clean: true,
+  username: SPAIN_MQTT_USER,
+  password: SPAIN_MQTT_PASS
+};
+
 // ======================================================
 // STARTUP
 // ======================================================
@@ -1554,7 +1577,9 @@ for (const region of REGIONS) {
 }
 
 console.log('Mode: READ ONLY');
-console.log('PR + FL + TX + US(default root): ENABLED');
+console.log('US global root: ENABLED');
+console.log('EU868 global root: ENABLED');
+console.log('Spain community broker: ENABLED (READ ONLY)');
 console.log('Binary MQTT traffic: TRY SERVICE ENVELOPE');
 console.log('/2/map/ ServiceEnvelope attempt: ENABLED');
 console.log('Other binary ServiceEnvelope attempt: ENABLED');
@@ -1580,6 +1605,7 @@ console.log('===================================');
 // ======================================================
 
 const mc = mqtt.connect(MQTT_URL, opts);
+const mcSpain = mqtt.connect(SPAIN_MQTT_URL, spainOpts);
 
 // ======================================================
 // MQTT CONNECT
@@ -1627,9 +1653,9 @@ mc.on('connect', connack => {
 // MQTT MESSAGE
 // ======================================================
 
-function handleMessage(topic, payload) {
+function handleMessage(topic, payload, regionOverride = null) {
 
-  const region = getRegionFromTopic(topic);
+  const region = regionOverride || getRegionFromTopic(topic);
 
   const mqttTopicType = getMqttTopicType(topic);
 
@@ -2381,6 +2407,54 @@ mc.on('message', (topic, payload, mqttPacket) => {
   }
 });
 
+// ======================================================
+// SPAIN COMMUNITY MQTT CLIENT - READ ONLY
+// ======================================================
+
+mcSpain.on('connect', connack => {
+  console.log('');
+  console.log('SPAIN MQTT CONNECTED');
+  console.log('SPAIN CONNACK:', JSON.stringify(connack));
+  console.log('SPAIN SUBSCRIBING TO:', SPAIN_MQTT_TOPIC);
+
+  mcSpain.subscribe(SPAIN_MQTT_TOPIC, { qos: 0 }, (err, granted) => {
+    if (err) {
+      console.error('SPAIN SUBSCRIBE ERROR:', err.message);
+      return;
+    }
+    console.log('SPAIN SUBACK:', JSON.stringify(granted));
+  });
+});
+
+mcSpain.on('message', (topic, payload, mqttPacket) => {
+  pktRetained = !!mqttPacket?.retain;
+  if (pktRetained) variantStats.retained++;
+
+  pktLog = [];
+  pktInteresting = false;
+  totalPackets++;
+  lastPacketAt = Date.now();
+
+  try {
+    handleMessage(topic, payload, SPAIN_REGION);
+  } catch (err) {
+    console.error('SPAIN HANDLER ERROR:', err.message);
+  } finally {
+    const buffered = pktLog;
+    pktLog = null;
+    if (VERBOSE || pktInteresting) {
+      for (const args of buffered) console.log(...args);
+    } else {
+      suppressedPackets++;
+    }
+  }
+});
+
+mcSpain.on('reconnect', () => console.log('SPAIN MQTT RECONNECTING'));
+mcSpain.on('offline', () => console.log('SPAIN MQTT OFFLINE'));
+mcSpain.on('close', () => console.log('SPAIN MQTT CONNECTION CLOSED'));
+mcSpain.on('error', err => console.error('SPAIN MQTT ERROR:', err.message));
+
 setInterval(() => {
 
   console.log('');
@@ -2705,7 +2779,7 @@ app.get('/api/geography', (req, res) => {
   res.json({
     service: 'VirtualMesh',
     mode: 'READ_ONLY',
-    geographicCore: 'v0.5-public-pr',
+    geographicCore: 'v0.5.2-spain',
     spain,
     eu868UnknownOrOutsideSpain,
     usUnknown,
@@ -2860,7 +2934,7 @@ app.get('/api/status', (req, res) => {
 
   res.json({
     service: 'VirtualMesh',
-    operationalCore: 'v0.4',
+    operationalCore: 'v0.5.2-spain',
     mqttState,
     topics: TOPICS,
     regions: REGIONS,
