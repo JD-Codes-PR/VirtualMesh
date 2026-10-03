@@ -33,6 +33,19 @@ const SPAIN_MQTT_USER = process.env.SPAIN_MQTT_USER || 'meshdev';
 const SPAIN_MQTT_PASS = process.env.SPAIN_MQTT_PASS || 'large4cats';
 const SPAIN_MQTT_TOPIC = process.env.SPAIN_MQTT_TOPIC || 'msh/EU_868/#';
 
+const spainMqttDiag = {
+  state: 'initializing',
+  url: SPAIN_MQTT_URL,
+  topic: SPAIN_MQTT_TOPIC,
+  connectedAt: null,
+  lastPacketAt: null,
+  packets: 0,
+  reconnects: 0,
+  closes: 0,
+  lastError: null,
+  lastSuback: null
+};
+
 // ======================================================
 // REGIONS
 // ======================================================
@@ -1605,6 +1618,17 @@ console.log('===================================');
 // ======================================================
 
 const mc = mqtt.connect(MQTT_URL, opts);
+
+console.log('');
+console.log('========== SPAIN MQTT DIAGNOSTIC ==========');
+console.log('[SPAIN] Connecting:', SPAIN_MQTT_URL);
+console.log('[SPAIN] Protocol: MQTT TCP / TLS disabled');
+console.log('[SPAIN] Client ID:', spainOpts.clientId);
+console.log('[SPAIN] Username:', SPAIN_MQTT_USER);
+console.log('[SPAIN] Topic:', SPAIN_MQTT_TOPIC);
+console.log('[SPAIN] Mode: READ ONLY - publish DISABLED');
+console.log('===========================================');
+spainMqttDiag.state = 'connecting';
 const mcSpain = mqtt.connect(SPAIN_MQTT_URL, spainOpts);
 
 // ======================================================
@@ -2412,21 +2436,31 @@ mc.on('message', (topic, payload, mqttPacket) => {
 // ======================================================
 
 mcSpain.on('connect', connack => {
+  spainMqttDiag.state = 'connected';
+  spainMqttDiag.connectedAt = new Date().toISOString();
+  spainMqttDiag.lastError = null;
   console.log('');
-  console.log('SPAIN MQTT CONNECTED');
-  console.log('SPAIN CONNACK:', JSON.stringify(connack));
-  console.log('SPAIN SUBSCRIBING TO:', SPAIN_MQTT_TOPIC);
+  console.log('[SPAIN] MQTT CONNECTED');
+  console.log('[SPAIN] CONNACK:', JSON.stringify(connack));
+  console.log('[SPAIN] SUBSCRIBING TO:', SPAIN_MQTT_TOPIC);
 
   mcSpain.subscribe(SPAIN_MQTT_TOPIC, { qos: 0 }, (err, granted) => {
     if (err) {
-      console.error('SPAIN SUBSCRIBE ERROR:', err.message);
+      spainMqttDiag.lastError = `SUBSCRIBE: ${err.message}`;
+      console.error('[SPAIN] SUBSCRIBE ERROR:', err.message);
       return;
     }
-    console.log('SPAIN SUBACK:', JSON.stringify(granted));
+    spainMqttDiag.lastSuback = granted;
+    console.log('[SPAIN] SUBACK:', JSON.stringify(granted));
   });
 });
 
 mcSpain.on('message', (topic, payload, mqttPacket) => {
+  spainMqttDiag.packets++;
+  spainMqttDiag.lastPacketAt = new Date().toISOString();
+  if (spainMqttDiag.packets <= 5 || spainMqttDiag.packets % 100 === 0) {
+    console.log(`[SPAIN] PACKET #${spainMqttDiag.packets}: ${topic} (${payload.length} bytes)`);
+  }
   pktRetained = !!mqttPacket?.retain;
   if (pktRetained) variantStats.retained++;
 
@@ -2450,10 +2484,35 @@ mcSpain.on('message', (topic, payload, mqttPacket) => {
   }
 });
 
-mcSpain.on('reconnect', () => console.log('SPAIN MQTT RECONNECTING'));
-mcSpain.on('offline', () => console.log('SPAIN MQTT OFFLINE'));
-mcSpain.on('close', () => console.log('SPAIN MQTT CONNECTION CLOSED'));
-mcSpain.on('error', err => console.error('SPAIN MQTT ERROR:', err.message));
+mcSpain.on('reconnect', () => { spainMqttDiag.state = 'reconnecting'; spainMqttDiag.reconnects++; console.log('[SPAIN] MQTT RECONNECTING'); });
+mcSpain.on('offline', () => { spainMqttDiag.state = 'offline'; console.log('[SPAIN] MQTT OFFLINE'); });
+mcSpain.on('close', () => { spainMqttDiag.state = 'closed'; spainMqttDiag.closes++; console.log('[SPAIN] MQTT CONNECTION CLOSED'); });
+mcSpain.on('error', err => {
+  spainMqttDiag.state = 'error';
+  spainMqttDiag.lastError = err?.message || String(err);
+  console.error('[SPAIN] MQTT ERROR:', spainMqttDiag.lastError);
+  if (err?.code) console.error('[SPAIN] ERROR CODE:', err.code);
+});
+
+setInterval(() => {
+  console.log('[SPAIN] STATUS:', JSON.stringify({
+    state: spainMqttDiag.state,
+    packets: spainMqttDiag.packets,
+    lastPacketAt: spainMqttDiag.lastPacketAt,
+    reconnects: spainMqttDiag.reconnects,
+    closes: spainMqttDiag.closes,
+    lastError: spainMqttDiag.lastError
+  }));
+}, 60000);
+
+app.get('/api/spain-status', (req, res) => {
+  res.json({
+    service: 'VirtualMesh',
+    mode: 'READ_ONLY',
+    source: 'SPAIN',
+    ...spainMqttDiag
+  });
+});
 
 setInterval(() => {
 
@@ -2626,7 +2685,7 @@ function topologySummary() {
   return gateways;
 }
 
-app.get('/api/health', (req, res) => res.json({ service:'VirtualMesh', mode:'READ_ONLY', operationalCore:'v0.5-public-pr', ...operationalSnapshot() }));
+app.get('/api/health', (req, res) => res.json({ service:'VirtualMesh', mode:'READ_ONLY', operationalCore:'v0.5.3-spain-diagnostic', ...operationalSnapshot() }));
 
 app.get('/api/topology', (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 1000);
