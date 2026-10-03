@@ -2546,7 +2546,7 @@ function topologySummary() {
   return gateways;
 }
 
-app.get('/api/health', (req, res) => res.json({ service:'VirtualMesh', mode:'READ_ONLY', operationalCore:'v0.4', ...operationalSnapshot() }));
+app.get('/api/health', (req, res) => res.json({ service:'VirtualMesh', mode:'READ_ONLY', operationalCore:'v0.5-public-pr', ...operationalSnapshot() }));
 
 app.get('/api/topology', (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 1000);
@@ -2692,7 +2692,7 @@ app.get('/api/geography', (req, res) => {
   res.json({
     service: 'VirtualMesh',
     mode: 'READ_ONLY',
-    geographicCore: 'v0.4',
+    geographicCore: 'v0.5-public-pr',
     spain,
     eu868UnknownOrOutsideSpain,
     usUnknown,
@@ -2739,6 +2739,47 @@ app.get('/api/health-history', (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 120), 1), HEALTH_HISTORY_MAX);
   res.json({ service:'VirtualMesh', mode:'READ_ONLY', count:Math.min(limit, healthHistory.length), samples:healthHistory.slice(-limit) });
 });
+
+// ======================================================
+// PUBLIC PUERTO RICO API v0.5
+// Privacy-first, READ ONLY. No directed/PKI messages, no keys,
+// no exact coordinates, no raw MQTT diagnostics.
+// ======================================================
+function publicNodeName(node) {
+  return node?.user?.longName || node?.mapReport?.longName || node?.longName || node?.user?.shortName || node?.mapReport?.shortName || node?.nodeHex || 'Meshtastic node';
+}
+function publicShortName(node) { return node?.user?.shortName || node?.mapReport?.shortName || node?.shortName || null; }
+function publicApproxPosition(node) {
+  const lat = Number(node?.latitude ?? node?.position?.latitude ?? node?.mapReport?.latitude);
+  const lon = Number(node?.longitude ?? node?.position?.longitude ?? node?.mapReport?.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return { latitude: Math.round(lat * 10) / 10, longitude: Math.round(lon * 10) / 10, approximate: true };
+}
+function isPuertoRicoNode(node) {
+  return String(node?.countryCode || '').toUpperCase() === 'US' && String(node?.subdivisionCode || '').toUpperCase() === 'PR';
+}
+function publicPrNodes() {
+  const now = Date.now();
+  return Array.from(uniqueNodes.values()).filter(isPuertoRicoNode).map(node => {
+    const seen = Date.parse(node.lastSeen || '');
+    const ageSeconds = Number.isFinite(seen) ? Math.max(0, Math.floor((now-seen)/1000)) : null;
+    const telemetry = node.telemetry || null;
+    return { nodeId:node.nodeHex, longName:publicNodeName(node), shortName:publicShortName(node), lastSeen:node.lastSeen||null,
+      ageSeconds, active:ageSeconds!==null && ageSeconds<=LIVE_MAX_AGE_SECONDS, position:publicApproxPosition(node),
+      telemetry:telemetry ? { type:telemetry.telemetryType||null, time:telemetry.time||null, metrics:telemetry.metrics||null } : null };
+  }).sort((a,b)=>String(b.lastSeen||'').localeCompare(String(a.lastSeen||'')));
+}
+function publicPrMessages() {
+  return getMessagesNewestFirst().map(m=>({...m,...(nodeGeographyForMessage(m.from)||{})}))
+    .filter(m=>String(m.subdivisionCode||'').toUpperCase()==='PR')
+    .filter(m=>m.broadcast===true && m.directed!==true && m.pki!==true)
+    .map(m=>{ const node=uniqueNodes.get(m.fromHex); return { id:m.key, from:m.fromHex, longName:publicNodeName(node), shortName:publicShortName(node), channel:m.channelId||null, text:m.text, firstSeen:m.firstSeen, lastSeen:m.lastSeen }; });
+}
+app.get('/api/public/pr/status',(req,res)=>{ const nodes=publicPrNodes(), messages=publicPrMessages();
+  res.json({service:'VirtualMesh Puerto Rico',mode:'READ_ONLY',publicApi:'v0.5',privacy:{exactCoordinates:false,directedMessages:false,pkiMessages:false,publicKeys:false},updatedAt:new Date().toISOString(),mqtt:mqttState==='connected'?'connected':'degraded',nodes:{known:nodes.length,active:nodes.filter(n=>n.active).length,sensors:nodes.filter(n=>n.telemetry?.type==='environmentMetrics').length},messages:{publicStored:messages.length}}); });
+app.get('/api/public/pr/nodes',(req,res)=>{const nodes=publicPrNodes();res.json({service:'VirtualMesh Puerto Rico',mode:'READ_ONLY',count:nodes.length,coordinatePrecision:'approximate',nodes});});
+app.get('/api/public/pr/messages',(req,res)=>{const limit=Math.min(Math.max(Number(req.query.limit||100),1),250),messages=publicPrMessages().slice(0,limit);res.json({service:'VirtualMesh Puerto Rico',mode:'READ_ONLY',visibility:'PUBLIC_BROADCAST_ONLY',count:messages.length,messages});});
+app.get('/api/public/pr/telemetry',(req,res)=>{const nodes=publicPrNodes().filter(n=>n.telemetry),environment=nodes.filter(n=>n.telemetry.type==='environmentMetrics'),device=nodes.filter(n=>n.telemetry.type==='deviceMetrics'),power=nodes.filter(n=>n.telemetry.type==='powerMetrics');res.json({service:'VirtualMesh Puerto Rico',mode:'READ_ONLY',count:nodes.length,environmentCount:environment.length,deviceCount:device.length,powerCount:power.length,environment,device,power});});
 
 // API - DIAGNOSTICS
 // ======================================================
@@ -2879,4 +2920,6 @@ server.listen(PORT, () => {
   console.log('Gateway topology: /api/topology');
   console.log('Operational playback: /api/playback');
   console.log('Operational alerts: /api/alerts');
+  console.log('Public PR portal: /puerto-rico.html');
+  console.log('Public PR API: /api/public/pr/status | /nodes | /messages | /telemetry');
 });
