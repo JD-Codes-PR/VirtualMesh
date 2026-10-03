@@ -273,6 +273,56 @@ const messageDedupStats = {
 const portStats = new Map();
 const regionStats = new Map();
 
+// ======================================================
+// CHANNEL DISCOVERY CORE - READ ONLY
+// Evidence is based on the MQTT source/root + channelId
+// actually observed on the wire. Geography is not used
+// to promote or corroborate a community channel.
+// ======================================================
+
+const channelDiscovery = new Map();
+
+function observeChannelDiscovery({ source, regionId, channelId, from, isText = false }) {
+  const src = String(source || regionId || 'UNKNOWN').trim() || 'UNKNOWN';
+  const channel = String(channelId || '(none)').trim() || '(none)';
+  const key = `${src}::${channel}`;
+  const now = new Date().toISOString();
+  let row = channelDiscovery.get(key);
+  if (!row) {
+    row = {
+      source: src,
+      regionId: regionId || 'UNKNOWN',
+      channelId: channel,
+      packets: 0,
+      textMessages: 0,
+      nodes: new Set(),
+      firstSeen: now,
+      lastSeen: now
+    };
+    channelDiscovery.set(key, row);
+  }
+  row.lastSeen = now;
+  if (isText) row.textMessages++;
+  else row.packets++;
+  const node = normalizeNodeNumber(from);
+  if (node !== null && node !== undefined && node !== 0) row.nodes.add(nodeIdToHex(node));
+}
+
+function getChannelDiscoveryObject() {
+  return [...channelDiscovery.values()]
+    .map(row => ({
+      source: row.source,
+      regionId: row.regionId,
+      channelId: row.channelId,
+      packets: row.packets,
+      textMessages: row.textMessages,
+      uniqueNodes: row.nodes.size,
+      firstSeen: row.firstSeen,
+      lastSeen: row.lastSeen
+    }))
+    .sort((a,b) => b.packets - a.packets || a.source.localeCompare(b.source) || a.channelId.localeCompare(b.channelId));
+}
+
 const jsonStats = {
   packets: 0,
   valid: 0,
@@ -1789,9 +1839,10 @@ mc.on('connect', connack => {
 // MQTT MESSAGE
 // ======================================================
 
-function handleMessage(topic, payload, regionOverride = null) {
+function handleMessage(topic, payload, regionOverride = null, sourceOverride = null) {
 
   const region = regionOverride || getRegionFromTopic(topic);
+  const discoverySource = sourceOverride || region.id;
 
   const mqttTopicType = getMqttTopicType(topic);
 
@@ -1866,6 +1917,14 @@ function handleMessage(topic, payload, regionOverride = null) {
     plog('Channel ID:', envelope.channelId || '(none)');
 
     const packet = envelope.packet;
+
+    observeChannelDiscovery({
+      source: discoverySource,
+      regionId: region.id,
+      channelId: envelope.channelId || '(none)',
+      from: packet?.from,
+      isText: false
+    });
 
     analyzeTraffic({
       gatewayId: envelope.gatewayId,
@@ -2203,6 +2262,8 @@ function handleMessage(topic, payload, regionOverride = null) {
         pktInteresting = true;
 
         addRegionMessage(region.id);
+
+        observeChannelDiscovery({ source: discoverySource, regionId: region.id, channelId: envelope.channelId || '(none)', from: packet.from, isText: true });
 
         const normalizedMessage = recordMessageObservation({
           regionId: region.id,
@@ -2556,7 +2617,7 @@ function createReadOnlyCommunityClient(label, url, username, password, topic, re
   console.log(`[${label}] Mode: READ ONLY - publish DISABLED`);
   const client = mqtt.connect(url, options);
   client.on('connect', connack => { diag.state='connected'; diag.connectedAt=new Date().toISOString(); diag.lastError=null; console.log(`[${label}] MQTT CONNECTED`); client.subscribe(topic,{qos:0},(err,granted)=>{ if(err){diag.lastError=`SUBSCRIBE: ${err.message}`; console.error(`[${label}] SUBSCRIBE ERROR:`,err.message);return;} diag.lastSuback=granted; console.log(`[${label}] SUBACK:`,JSON.stringify(granted)); }); });
-  client.on('message',(mqttTopic,payload,mqttPacket)=>{ diag.packets++; diag.lastPacketAt=new Date().toISOString(); if(diag.packets<=5||diag.packets%100===0) console.log(`[${label}] PACKET #${diag.packets}: ${mqttTopic} (${payload.length} bytes)`); pktRetained=!!mqttPacket?.retain; if(pktRetained)variantStats.retained++; pktLog=[]; pktInteresting=false; totalPackets++; lastPacketAt=Date.now(); try{handleMessage(mqttTopic,payload,region);}catch(err){console.error(`${label} HANDLER ERROR:`,err.message);}finally{const buffered=pktLog;pktLog=null;if(VERBOSE||pktInteresting){for(const args of buffered)console.log(...args);}else suppressedPackets++;} });
+  client.on('message',(mqttTopic,payload,mqttPacket)=>{ diag.packets++; diag.lastPacketAt=new Date().toISOString(); if(diag.packets<=5||diag.packets%100===0) console.log(`[${label}] PACKET #${diag.packets}: ${mqttTopic} (${payload.length} bytes)`); pktRetained=!!mqttPacket?.retain; if(pktRetained)variantStats.retained++; pktLog=[]; pktInteresting=false; totalPackets++; lastPacketAt=Date.now(); try{handleMessage(mqttTopic,payload,region,label);}catch(err){console.error(`${label} HANDLER ERROR:`,err.message);}finally{const buffered=pktLog;pktLog=null;if(VERBOSE||pktInteresting){for(const args of buffered)console.log(...args);}else suppressedPackets++;} });
   client.on('reconnect',()=>{diag.state='reconnecting';diag.reconnects++;}); client.on('offline',()=>{diag.state='offline';}); client.on('close',()=>{diag.state='closed';diag.closes++;}); client.on('error',err=>{diag.state='error';diag.lastError=err?.message||String(err);console.error(`[${label}] MQTT ERROR:`,diag.lastError);});
   return {client,diag};
 }
@@ -2606,7 +2667,7 @@ mcOzulo.on('message', (topic, payload, mqttPacket) => {
   try {
     // O Zulo is a Spanish community source; normalize into SPAIN while
     // keeping independent source diagnostics above.
-    handleMessage(topic, payload, SPAIN_REGION);
+    handleMessage(topic, payload, SPAIN_REGION, 'SPAIN_OZULO');
   } catch (err) {
     console.error('OZULO HANDLER ERROR:', err.message);
   } finally {
@@ -2690,7 +2751,7 @@ mcSpain.on('message', (topic, payload, mqttPacket) => {
   lastPacketAt = Date.now();
 
   try {
-    handleMessage(topic, payload, SPAIN_REGION);
+    handleMessage(topic, payload, SPAIN_REGION, 'SPAIN_DIRECT');
   } catch (err) {
     console.error('SPAIN HANDLER ERROR:', err.message);
   } finally {
@@ -2750,6 +2811,7 @@ setInterval(() => {
   console.log('Observed nodes:', observedNodes.size);
   console.log('Nodes by region:', JSON.stringify(getNodeCountsByRegion()));
   console.log('Region traffic:', JSON.stringify(getRegionStatsObject()));
+  console.log('Channel discovery:', JSON.stringify(getChannelDiscoveryObject().slice(0, 50)));
   console.log('Ports:', JSON.stringify(
     getPortStatsObject().map(p => `${p.portName}=${p.total}`)
   ));
@@ -3153,6 +3215,23 @@ app.get('/api/public/pr/telemetry',(req,res)=>{const nodes=publicPrNodes().filte
 
 // API - DIAGNOSTICS
 // ======================================================
+
+app.get('/api/channel-discovery', (req, res) => {
+  const source = req.query.source ? String(req.query.source).toUpperCase() : null;
+  const channel = req.query.channel ? String(req.query.channel).toLowerCase() : null;
+  let rows = getChannelDiscoveryObject();
+  if (source) rows = rows.filter(r => String(r.source).toUpperCase() === source || String(r.regionId).toUpperCase() === source);
+  if (channel) rows = rows.filter(r => String(r.channelId).toLowerCase().includes(channel));
+  res.json({
+    service: 'VirtualMesh',
+    mode: 'READ_ONLY',
+    core: 'CHANNEL_DISCOVERY',
+    attribution: 'MQTT_SOURCE_PLUS_CHANNEL_ID',
+    geographyUsedForCorroboration: false,
+    count: rows.length,
+    channels: rows
+  });
+});
 
 app.get('/api/diagnostics', (req, res) => {
 
