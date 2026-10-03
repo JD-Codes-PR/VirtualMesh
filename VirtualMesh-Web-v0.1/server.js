@@ -715,6 +715,11 @@ function recordMessageObservation({
     if (transport && !existing.transports.includes(transport)) existing.transports.push(transport);
     if (topic && !existing.topics.includes(topic) && existing.topics.length < 12) existing.topics.push(topic);
     existing.pki = existing.pki || pki;
+    // Preserve the MQTT transport region on the normalized message.
+    // This lets the private monitor separate US vs EU868 even when a sender
+    // has not published coordinates yet. Geographic PR classification still
+    // requires known coordinates / node geography.
+    existing.region ||= regionId || null;
     return { isNew: false, message: existing };
   }
 
@@ -729,6 +734,7 @@ function recordMessageObservation({
     directed: !!isDirected,
     broadcast: !isDirected,
     pki: !!pki,
+    region: regionId || null,
     channelId: channelId || null,
     text,
     ...(nodeGeographyForMessage(from) || {}),
@@ -2618,6 +2624,8 @@ app.get('/api/messages', (req, res) => {
   const pki = String(req.query.pki || '').toLowerCase();
   const country = String(req.query.country || '').trim().toUpperCase();
   const state = String(req.query.state || '').trim().toUpperCase();
+  const region = String(req.query.region || '').trim().toUpperCase();
+  const limit = Math.min(Math.max(Number(req.query.limit || MESSAGE_INBOX_MAX), 1), MESSAGE_INBOX_MAX);
   let messages = getMessagesNewestFirst().map(m => ({
     ...m,
     ...(nodeGeographyForMessage(m.from) || {})
@@ -2628,6 +2636,11 @@ app.get('/api/messages', (req, res) => {
   if (pki === 'false') messages = messages.filter(m => !m.pki);
   if (country) messages = messages.filter(m => String(m.countryCode || '').toUpperCase() === country);
   if (state) messages = messages.filter(m => String(m.subdivisionCode || '').toUpperCase() === state);
+  if (region) messages = messages.filter(m =>
+    String(m.region || '').toUpperCase() === region ||
+    (Array.isArray(m.regionsSeen) && m.regionsSeen.some(r => String(r).toUpperCase() === region))
+  );
+  messages = messages.slice(0, limit);
   res.json({
     service: 'VirtualMesh',
     mode: 'READ_ONLY',
@@ -2756,8 +2769,12 @@ function publicApproxPosition(node) {
   return { latitude: Math.round(lat * 10) / 10, longitude: Math.round(lon * 10) / 10, approximate: true };
 }
 function isPuertoRicoNode(node) {
-  return String(node?.countryCode || '').toUpperCase() === 'US' && String(node?.subdivisionCode || '').toUpperCase() === 'PR';
+  // Geographic Core represents Puerto Rico with subdivisionCode=PR.
+  // Accept either countryCode=PR (current classifier) or US+PR for backward compatibility.
+  return String(node?.subdivisionCode || '').toUpperCase() === 'PR' ||
+    String(node?.countryCode || '').toUpperCase() === 'PR';
 }
+
 function publicPrNodes() {
   const now = Date.now();
   return Array.from(uniqueNodes.values()).filter(isPuertoRicoNode).map(node => {
