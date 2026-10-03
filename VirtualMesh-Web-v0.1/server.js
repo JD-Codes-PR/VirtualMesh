@@ -382,6 +382,83 @@ function getChannelDiscoveryObject() {
     .sort((a,b) => b.packets - a.packets || a.source.localeCompare(b.source) || a.channelId.localeCompare(b.channelId));
 }
 
+// ======================================================
+// CANDIDATE ANALYZER CORE - READ ONLY
+// Ranks OBSERVED/DISCOVERY channels for manual research only.
+// A score NEVER promotes a channel to VERIFIED. Geography is not used.
+// ======================================================
+
+function analyzeChannelCandidate(row) {
+  const status = row?.classification?.status || 'DISCOVERY';
+  const packets = Math.max(0, Number(row?.packets || 0));
+  const textMessages = Math.max(0, Number(row?.textMessages || 0));
+  const uniqueNodes = Math.max(0, Number(row?.uniqueNodes || 0));
+  const first = Date.parse(row?.firstSeen || '');
+  const last = Date.parse(row?.lastSeen || '');
+  const spanMinutes = Number.isFinite(first) && Number.isFinite(last)
+    ? Math.max(0, Math.round((last - first) / 60000))
+    : 0;
+
+  let score = 0;
+  const reasons = [];
+
+  // Strongest signal: actual decoded text activity.
+  if (textMessages >= 5) { score += 35; reasons.push('5+ decoded text messages'); }
+  else if (textMessages >= 2) { score += 28; reasons.push('2+ decoded text messages'); }
+  else if (textMessages === 1) { score += 20; reasons.push('decoded text message observed'); }
+
+  // Community-like activity should involve more than one node.
+  if (uniqueNodes >= 20) { score += 25; reasons.push('20+ unique nodes'); }
+  else if (uniqueNodes >= 5) { score += 20; reasons.push('5+ unique nodes'); }
+  else if (uniqueNodes >= 2) { score += 12; reasons.push('multiple unique nodes'); }
+  else if (uniqueNodes === 1) { score += 3; reasons.push('single node only'); }
+
+  // Sustained packet activity. Logarithmic-ish buckets prevent flood volume dominating.
+  if (packets >= 100) { score += 20; reasons.push('100+ packets observed'); }
+  else if (packets >= 25) { score += 16; reasons.push('25+ packets observed'); }
+  else if (packets >= 10) { score += 12; reasons.push('10+ packets observed'); }
+  else if (packets >= 3) { score += 7; reasons.push('3+ packets observed'); }
+  else if (packets >= 1) { score += 2; reasons.push('packet observed'); }
+
+  // Recurrence during the current server lifetime.
+  if (spanMinutes >= 360) { score += 15; reasons.push('active across 6+ hours'); }
+  else if (spanMinutes >= 60) { score += 12; reasons.push('active across 1+ hour'); }
+  else if (spanMinutes >= 15) { score += 8; reasons.push('active across 15+ minutes'); }
+  else if (spanMinutes >= 3) { score += 4; reasons.push('repeated across 3+ minutes'); }
+
+  // Dedicated Spanish community source is useful evidence, but still not verification.
+  if (status === 'OBSERVED') { score += 5; reasons.push('dedicated community MQTT source observed'); }
+
+  score = Math.min(100, score);
+  let priority = 'LOW';
+  if (score >= 70) priority = 'HIGH';
+  else if (score >= 45) priority = 'MEDIUM';
+
+  return {
+    score,
+    priority,
+    spanMinutes,
+    reasons,
+    recommendation: priority === 'HIGH'
+      ? 'RESEARCH_NOW'
+      : priority === 'MEDIUM'
+        ? 'RESEARCH_WHEN_PRACTICAL'
+        : 'KEEP_OBSERVING'
+  };
+}
+
+function getChannelCandidates() {
+  return getChannelDiscoveryObject()
+    .filter(row => ['DISCOVERY','OBSERVED'].includes(row.classification?.status || 'DISCOVERY'))
+    .map(row => ({ ...row, candidate: analyzeChannelCandidate(row) }))
+    .sort((a,b) =>
+      b.candidate.score - a.candidate.score ||
+      b.textMessages - a.textMessages ||
+      b.uniqueNodes - a.uniqueNodes ||
+      b.packets - a.packets
+    );
+}
+
 const jsonStats = {
   packets: 0,
   valid: 0,
@@ -3300,6 +3377,48 @@ app.get('/api/channel-discovery', (req, res) => {
 });
 
 
+app.get('/api/channel-candidates', (req, res) => {
+  const source = req.query.source ? String(req.query.source).toUpperCase() : null;
+  const priority = req.query.priority ? String(req.query.priority).toUpperCase() : null;
+  const minScoreRaw = Number(req.query.minScore ?? 0);
+  const minScore = Number.isFinite(minScoreRaw) ? Math.max(0, Math.min(100, minScoreRaw)) : 0;
+  const limitRaw = Number(req.query.limit ?? 100);
+  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(500, Math.floor(limitRaw))) : 100;
+
+  let candidates = getChannelCandidates();
+  if (source) candidates = candidates.filter(r => String(r.source).toUpperCase() === source || String(r.regionId).toUpperCase() === source);
+  if (priority) candidates = candidates.filter(r => r.candidate.priority === priority);
+  candidates = candidates.filter(r => r.candidate.score >= minScore).slice(0, limit);
+
+  const all = getChannelCandidates();
+  const priorityCounts = { HIGH: 0, MEDIUM: 0, LOW: 0 };
+  for (const row of all) priorityCounts[row.candidate.priority]++;
+
+  res.json({
+    service: 'VirtualMesh',
+    mode: 'READ_ONLY',
+    core: 'CANDIDATE_ANALYZER',
+    purpose: 'RESEARCH_PRIORITIZATION_ONLY',
+    automaticPromotion: false,
+    geographyUsed: false,
+    scoring: {
+      decodedText: '0-35',
+      uniqueNodes: '0-25',
+      packetActivity: '0-20',
+      recurrenceCurrentRuntime: '0-15',
+      dedicatedObservedSource: '0-5',
+      high: '70-100',
+      medium: '45-69',
+      low: '0-44'
+    },
+    filters: { source, priority, minScore, limit },
+    totalCandidates: all.length,
+    priorityCounts,
+    count: candidates.length,
+    candidates
+  });
+});
+
 app.get('/api/channel-classification', (req, res) => {
   const rows = getChannelDiscoveryObject();
   const groups = { VERIFIED: [], VERIFIED_SOURCE: [], OBSERVED: [], DISCOVERY: [] };
@@ -3444,6 +3563,7 @@ server.listen(PORT, () => {
   console.log('MQTT publish: DISABLED');
   console.log('Diagnostics endpoint: /api/diagnostics');
   console.log('Traffic analyzer endpoint: /api/traffic-analyzer');
+  console.log('Channel candidate analyzer: /api/channel-candidates');
   console.log('Normalized message inbox: /api/messages');
   console.log('Global unique nodes: /api/unique-nodes');
   console.log('Live nodes (15 min): /api/live-nodes?country=ES or ?state=PR');
