@@ -3,6 +3,7 @@ import http from 'http';
 import { WebSocketServer } from 'ws';
 import mqtt from 'mqtt';
 import crypto from 'crypto';
+import { readFileSync } from 'fs';
 import { fromBinary, toBinary, create } from '@bufbuild/protobuf';
 
 import {
@@ -191,7 +192,15 @@ function candidateChannelKeys(channelId) {
 // ======================================================
 const VNODE_LONG_NAME = process.env.VNODE_LONG_NAME || 'VirtualMesh';
 const VNODE_SHORT_NAME = process.env.VNODE_SHORT_NAME || 'VM01';
-const VNODE_ROUTE = process.env.VNODE_ROUTE || '/vm-control-7f3a9c2e';
+const VNODE_ROUTE_RAW = String(process.env.VNODE_ROUTE || '/vm-jd-control').trim();
+const VNODE_ROUTE = (() => {
+  let r = VNODE_ROUTE_RAW || '/vm-jd-control';
+  if (!r.startsWith('/')) r = '/' + r;
+  r = r.replace(/\/+$/, '');
+  if (!/^\/[A-Za-z0-9._~-]+(?:\/[A-Za-z0-9._~-]+)*$/.test(r)) return '/vm-jd-control';
+  return r;
+})();
+const VNODE_PANEL_HTML = readFileSync(new URL('./private/virtual-node.html', import.meta.url), 'utf8');
 const VNODE_TOKEN = process.env.VNODE_TOKEN || '';
 const VNODE_ID_SEED = String(process.env.VNODE_ID_SEED || '');
 const VNODE_TX_CONFIGURED = VNODE_ID_SEED.length >= 24;
@@ -3896,10 +3905,15 @@ app.get('/api/status', (req, res) => {
 // VIRTUAL NODE PRIVATE PANEL / API
 // Not linked from public pages.
 // ======================================================
-app.get(VNODE_ROUTE, (req,res) => res.sendFile(process.cwd() + '/private/virtual-node.html'));
+app.get([VNODE_ROUTE, VNODE_ROUTE + '/'], (req,res) => {
+  res.set('Cache-Control','no-store');
+  res.type('html').send(VNODE_PANEL_HTML);
+});
+// Deliberately do not expose the obvious filename.
+app.get('/virtual-node.html', (req,res) => res.status(404).send('Not Found'));
 app.get(VNODE_ROUTE + '/api/status', vnodeAuth, (req,res)=>{
   const dests=vnodeDestinations();
-  res.json({service:'VirtualMesh Virtual Node',version:'v1.0.0',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20)});
+  res.json({service:'VirtualMesh Virtual Node',version:'v1.0.1',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20)});
 });
 app.post(VNODE_ROUTE + '/api/send', vnodeAuth, async (req,res)=>{
   try{
@@ -3922,6 +3936,8 @@ app.post(VNODE_ROUTE + '/api/announce', vnodeAuth, async (req,res)=>{
 server.listen(PORT, () => {
 
   console.log(`VirtualMesh Web listening on ${PORT}`);
+  console.log(`Virtual Node private route: ${VNODE_ROUTE}`);
+  console.log(`Virtual Node TX configured: ${VNODE_TX_CONFIGURED ? 'YES' : 'NO'}`);
   console.log('MQTT mode: READ ONLY');
   console.log('Traffic mode: DIAGNOSTIC TRY ALL');
   console.log('Listening regions:', TOPICS.join(', '));
