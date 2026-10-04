@@ -3,7 +3,7 @@ import http from 'http';
 import { WebSocketServer } from 'ws';
 import mqtt from 'mqtt';
 import crypto from 'crypto';
-import { fromBinary } from '@bufbuild/protobuf';
+import { fromBinary, toBinary, create } from '@bufbuild/protobuf';
 
 import {
   Mqtt,
@@ -186,11 +186,122 @@ function candidateChannelKeys(channelId) {
 
 
 // ======================================================
+// VIRTUAL NODE v1.0 - isolated transmitter
+// The rest of VirtualMesh remains diagnostic/read-only.
+// ======================================================
+const VNODE_LONG_NAME = process.env.VNODE_LONG_NAME || 'VirtualMesh';
+const VNODE_SHORT_NAME = process.env.VNODE_SHORT_NAME || 'VM01';
+const VNODE_ROUTE = process.env.VNODE_ROUTE || '/vm-control-7f3a9c2e';
+const VNODE_TOKEN = process.env.VNODE_TOKEN || '';
+const VNODE_ID_SEED = String(process.env.VNODE_ID_SEED || '');
+const VNODE_TX_CONFIGURED = VNODE_ID_SEED.length >= 24;
+const VNODE_ID = (() => {
+  const configured = String(process.env.VNODE_ID || '').trim().replace(/^!/, '');
+  if (/^[0-9a-fA-F]{8}$/.test(configured)) return parseInt(configured, 16) >>> 0;
+  if (/^\d+$/.test(configured)) return Number(configured) >>> 0;
+  const seed = VNODE_ID_SEED || crypto.randomBytes(32).toString('hex');
+  return crypto.createHash('sha256').update('node-id:'+seed).digest().readUInt32LE(0) >>> 0;
+})();
+const VNODE_HEX = '!' + VNODE_ID.toString(16).padStart(8,'0');
+
+function makeX25519Identity() {
+  const configuredPrivate = String(process.env.VNODE_PRIVATE_KEY_PEM || '').replace(/\\n/g,'\n').trim();
+  if (configuredPrivate) {
+    const privateKey = crypto.createPrivateKey(configuredPrivate);
+    return { privateKey, publicKey:crypto.createPublicKey(privateKey) };
+  }
+  if (VNODE_ID_SEED) {
+    // RFC8410 PKCS#8 wrapper around a deterministic 32-byte X25519 private value.
+    const raw = crypto.createHash('sha256').update('x25519:'+VNODE_ID_SEED).digest();
+    const prefix = Buffer.from('302e020100300506032b656e04220420','hex');
+    const privateKey = crypto.createPrivateKey({key:Buffer.concat([prefix,raw]),format:'der',type:'pkcs8'});
+    return { privateKey, publicKey:crypto.createPublicKey(privateKey) };
+  }
+  return crypto.generateKeyPairSync('x25519');
+}
+const VNODE_KEYS = makeX25519Identity();
+function rawX25519PublicKey(keyObj) {
+  const der = keyObj.export({type:'spki',format:'der'});
+  return Buffer.from(der).subarray(-32);
+}
+const VNODE_PUBLIC_KEY = rawX25519PublicKey(VNODE_KEYS.publicKey);
+
+let vnodePacketCounter = crypto.randomBytes(4).readUInt32LE(0) >>> 0;
+const vnodeTxLog = [];
+function nextVnodePacketId() {
+  vnodePacketCounter = (vnodePacketCounter + 1) >>> 0;
+  if (vnodePacketCounter === 0) vnodePacketCounter = 1;
+  return vnodePacketCounter;
+}
+function vnodeNonce(packetId, fromNode) {
+  const nonce = Buffer.alloc(16);
+  nonce.writeBigUInt64LE(BigInt(packetId >>> 0), 0);
+  nonce.writeUInt32LE(fromNode >>> 0, 8);
+  return nonce;
+}
+function encryptVnodeData(plain, packetId, fromNode, key) {
+  const algorithm = key.length === 32 ? 'aes-256-ctr' : 'aes-128-ctr';
+  const cipher = crypto.createCipheriv(algorithm, key, vnodeNonce(packetId, fromNode));
+  cipher.setAutoPadding(false);
+  return Buffer.concat([cipher.update(Buffer.from(plain)), cipher.final()]);
+}
+function vnodeAuth(req,res,next) {
+  if (!VNODE_TOKEN) return next(); // obscured route mode; set token for real access control
+  const token = String(req.get('x-virtualmesh-token') || req.query.token || '');
+  const a = Buffer.from(token); const b = Buffer.from(VNODE_TOKEN);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a,b)) return res.status(401).json({ok:false,error:'Unauthorized'});
+  next();
+}
+function vnodeDestinations() {
+  return {
+    PR: { label:'Puerto Rico', client:mc, topicRoot:'msh/US/PR', channel:'LongFast', key:LONGFAST_KEY },
+    US: { label:'United States', client:mc, topicRoot:'msh/US', channel:'LongFast', key:LONGFAST_KEY },
+    SPAIN: { label:'España · O Zulo', client:mcOzulo, topicRoot:'msh/EU_868', channel:'LongFast', key:LONGFAST_KEY },
+    CHILE: { label:'Chile', client:chileSource?.client, topicRoot:'msh/CL', channel:'LongFast', key:LONGFAST_KEY },
+    COLOMBIA: { label:'Colombia', client:colombiaSource?.client, topicRoot:'msh/CO', channel:'LongFast', key:LONGFAST_KEY }
+  };
+}
+function buildVnodeEnvelope(portnum, appPayload, channelName='LongFast', key=LONGFAST_KEY) {
+  const packetId = nextVnodePacketId();
+  const data = create(Mesh.DataSchema, { portnum, payload: Buffer.from(appPayload), wantResponse:false, requestId:0, replyId:0 });
+  const plain = toBinary(Mesh.DataSchema, data);
+  const encrypted = encryptVnodeData(plain, packetId, VNODE_ID, key);
+  const packet = create(Mesh.MeshPacketSchema, {
+    from: VNODE_ID, to: 0xffffffff, channel: 0, id: packetId,
+    hopLimit: 3, hopStart: 3, viaMqtt: true,
+    payloadVariant: { case:'encrypted', value:encrypted }
+  });
+  const envelope = create(Mqtt.ServiceEnvelopeSchema, { packet, channelId:channelName, gatewayId:VNODE_HEX });
+  return { packetId, bytes:Buffer.from(toBinary(Mqtt.ServiceEnvelopeSchema,envelope)) };
+}
+function publishVnode(destinationKey, portnum, payload) {
+  if (!VNODE_TX_CONFIGURED) return Promise.reject(new Error('Configura VNODE_ID_SEED en Render antes de transmitir'));
+  const d = vnodeDestinations()[destinationKey];
+  if (!d) return Promise.reject(new Error('Destino no permitido'));
+  if (!d.client?.connected) return Promise.reject(new Error(`Broker ${d.label} no conectado`));
+  const built = buildVnodeEnvelope(portnum,payload,d.channel,d.key);
+  const topic = `${d.topicRoot}/2/e/${d.channel}/${VNODE_HEX}`;
+  return new Promise((resolve,reject)=>d.client.publish(topic,built.bytes,{qos:0,retain:false},err=>{
+    const entry={at:new Date().toISOString(),destination:destinationKey,topic,packetId:built.packetId,portnum,ok:!err,error:err?.message||null};
+    vnodeTxLog.unshift(entry); if(vnodeTxLog.length>50)vnodeTxLog.length=50;
+    if(err) reject(err); else resolve(entry);
+  }));
+}
+function vnodeUserPayload() {
+  const user = create(Mesh.UserSchema, {
+    id: VNODE_HEX, longName:VNODE_LONG_NAME, shortName:VNODE_SHORT_NAME,
+    hwModel:0, isLicensed:false, role:0, publicKey:VNODE_PUBLIC_KEY
+  });
+  return Buffer.from(toBinary(Mesh.UserSchema,user));
+}
+
+// ======================================================
 // EXPRESS / WEBSOCKET
 // ======================================================
 
 const app = express();
 
+app.use(express.json({ limit: '16kb' }));
 app.use(express.static('public'));
 
 const server = http.createServer(app);
@@ -2014,7 +2125,7 @@ console.log('Public key capture: ENABLED');
 console.log('Traffic analyzer:', TRAFFIC_ANALYZER ? 'ENABLED (diagnostic, no blocking)' : 'DISABLED');
 console.log('Per-packet log:', VERBOSE ? 'VERBOSE' : 'QUIET (interesting only + 60s summary)');
 console.log('MQTT publish: DISABLED');
-  console.log('Experience Layer v0.7.3: dashboard | nodes | conversations | network | channels');
+  console.log('Experience Layer v0.7.5 + Virtual Node v1.0: dashboard | nodes | conversations | network | channels');
 console.log('===================================');
 
 // ======================================================
@@ -3781,6 +3892,33 @@ app.get('/api/status', (req, res) => {
 // START SERVER
 // ======================================================
 
+// ======================================================
+// VIRTUAL NODE PRIVATE PANEL / API
+// Not linked from public pages.
+// ======================================================
+app.get(VNODE_ROUTE, (req,res) => res.sendFile(process.cwd() + '/private/virtual-node.html'));
+app.get(VNODE_ROUTE + '/api/status', vnodeAuth, (req,res)=>{
+  const dests=vnodeDestinations();
+  res.json({service:'VirtualMesh Virtual Node',version:'v1.0.0',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20)});
+});
+app.post(VNODE_ROUTE + '/api/send', vnodeAuth, async (req,res)=>{
+  try{
+    const destination=String(req.body?.destination||'PR').toUpperCase();
+    const message=String(req.body?.message||'').trim();
+    if(!message) return res.status(400).json({ok:false,error:'Mensaje vacío'});
+    if(Buffer.byteLength(message,'utf8')>220) return res.status(400).json({ok:false,error:'Mensaje demasiado largo (máx. 220 bytes UTF-8)'});
+    const entry=await publishVnode(destination,Portnums.PortNum.TEXT_MESSAGE_APP,Buffer.from(message,'utf8'));
+    res.json({ok:true,...entry,nodeId:VNODE_HEX});
+  }catch(err){res.status(502).json({ok:false,error:err?.message||String(err)});}
+});
+app.post(VNODE_ROUTE + '/api/announce', vnodeAuth, async (req,res)=>{
+  try{
+    const destination=String(req.body?.destination||'PR').toUpperCase();
+    const entry=await publishVnode(destination,Portnums.PortNum.NODEINFO_APP,vnodeUserPayload());
+    res.json({ok:true,...entry,nodeId:VNODE_HEX});
+  }catch(err){res.status(502).json({ok:false,error:err?.message||String(err)});}
+});
+
 server.listen(PORT, () => {
 
   console.log(`VirtualMesh Web listening on ${PORT}`);
@@ -3797,7 +3935,7 @@ server.listen(PORT, () => {
   console.log('MAP_REPORT_APP: DECODE');
   console.log('Public keys: CAPTURE');
   console.log('MQTT publish: DISABLED');
-  console.log('Experience Layer v0.7.3: dashboard | nodes | conversations | network | channels');
+  console.log('Experience Layer v0.7.5 + Virtual Node v1.0: dashboard | nodes | conversations | network | channels');
   console.log('Diagnostics endpoint: /api/diagnostics');
   console.log('Traffic analyzer endpoint: /api/traffic-analyzer');
   console.log('Channel candidate analyzer v2: /api/channel-candidates');
