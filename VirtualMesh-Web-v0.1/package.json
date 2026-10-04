@@ -1,11 +1,9 @@
 {
   "name": "virtualmesh-web",
-  "version": "0.1.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": {"start": "node server.js"},
   "dependencies": {
     "@bufbuild/protobuf": "^2.9.0",
     "@meshtastic/protobufs": "2.8.0",

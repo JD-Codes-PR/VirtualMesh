@@ -245,6 +245,68 @@ const VNODE_PUBLIC_KEY = rawX25519PublicKey(VNODE_KEYS.publicKey);
 
 let vnodePacketCounter = crypto.randomBytes(4).readUInt32LE(0) >>> 0;
 const vnodeTxLog = [];
+
+// ======================================================
+// VIRTUAL NODE v1.1 - TX TRACKER
+// Tracks our own packet IDs as they reappear on subscribed MQTT roots.
+// Important: a second MQTT/gateway observation is evidence of propagation,
+// but is NOT by itself proof that an RF/LoRa receiver heard the packet.
+// ======================================================
+const VNODE_TRACK_TTL_MS = 10 * 60 * 1000;
+const vnodeTxTracker = new Map();
+
+function vnodeTrackerKey(packetId) {
+  return `${VNODE_ID >>> 0}:${Number(packetId) >>> 0}`;
+}
+function trackerStatus(t) {
+  const gateways = Array.from(t.gateways || []);
+  const foreignGateways = gateways.filter(g => g && g !== VNODE_HEX);
+  let stage = 'MQTT_PUBLISHED';
+  let rfEvidence = 'NONE';
+  if (t.observations > 0) stage = 'MQTT_OBSERVED';
+  if (foreignGateways.length > 0) {
+    stage = 'GATEWAY_OBSERVED';
+    rfEvidence = 'POSSIBLE';
+  }
+  return { stage, rfEvidence, rfConfirmed:false, gateways, foreignGateways };
+}
+function serializeVnodeTracker(t) {
+  const st = trackerStatus(t);
+  return {
+    packetId:t.packetId, destination:t.destination, topic:t.topic, portnum:t.portnum,
+    message:t.message ?? null, publishedAt:t.publishedAt, expiresAt:t.expiresAt,
+    observations:t.observations, firstObservedAt:t.firstObservedAt, lastObservedAt:t.lastObservedAt,
+    regions:Array.from(t.regions), sources:Array.from(t.sources), topics:Array.from(t.topics),
+    ...st,
+    note: st.rfConfirmed ? 'Recepción RF confirmada.' : (st.rfEvidence === 'POSSIBLE' ? 'Otro gateway observó el mismo paquete. Es evidencia de propagación, no prueba definitiva de recepción LoRa.' : 'Publicación MQTT confirmada; todavía no hay evidencia de otro gateway.')
+  };
+}
+function pruneVnodeTracker() {
+  const now=Date.now();
+  for (const [k,t] of vnodeTxTracker) if (now > t.expiresAt + 60*60*1000) vnodeTxTracker.delete(k);
+}
+function startVnodeTracker(entry, message=null) {
+  const published=Date.parse(entry.at) || Date.now();
+  const t={
+    packetId:entry.packetId >>> 0, destination:entry.destination, topic:entry.topic,
+    portnum:entry.portnum, message, publishedAt:new Date(published).toISOString(),
+    expiresAt:published+VNODE_TRACK_TTL_MS, observations:0, firstObservedAt:null,lastObservedAt:null,
+    gateways:new Set(),regions:new Set(),sources:new Set(),topics:new Set()
+  };
+  vnodeTxTracker.set(vnodeTrackerKey(t.packetId),t); pruneVnodeTracker(); return t;
+}
+function observeVnodeTx(result, topic, source=null) {
+  if (!result?.meshPacket || (Number(result.from)>>>0)!==(VNODE_ID>>>0)) return;
+  const key=vnodeTrackerKey(result.id); const t=vnodeTxTracker.get(key); if(!t) return;
+  const now=Date.now(); if(now>t.expiresAt) return;
+  t.observations++; const iso=new Date(now).toISOString();
+  t.firstObservedAt ||= iso; t.lastObservedAt=iso;
+  if(result.gatewayId) t.gateways.add(String(result.gatewayId));
+  if(result.region) t.regions.add(String(result.region));
+  if(source) t.sources.add(String(source));
+  if(topic) t.topics.add(String(topic));
+}
+
 function nextVnodePacketId() {
   vnodePacketCounter = (vnodePacketCounter + 1) >>> 0;
   if (vnodePacketCounter === 0) vnodePacketCounter = 1;
@@ -2940,6 +3002,9 @@ function handleMessage(topic, payload, regionOverride = null, sourceOverride = n
     };
   }
 
+  // Virtual Node TX Tracker: observe our packet if it reappears on any subscribed source.
+  observeVnodeTx(result, topic, sourceOverride || region.id);
+
   // ==================================================
   // SEND TO BROWSER
   // ==================================================
@@ -3924,7 +3989,8 @@ app.get([VNODE_ROUTE, VNODE_ROUTE + '/'], (req,res) => {
 app.get('/virtual-node.html', (req,res) => res.status(404).send('Not Found'));
 app.get(VNODE_ROUTE + '/api/status', vnodeAuth, (req,res)=>{
   const dests=vnodeDestinations();
-  res.json({service:'VirtualMesh Virtual Node',version:'v1.0.2',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20)});
+  pruneVnodeTracker();
+  res.json({service:'VirtualMesh Virtual Node',version:'v1.1.0',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20),tracker:Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt)).slice(0,20).map(serializeVnodeTracker)});
 });
 app.post(VNODE_ROUTE + '/api/send', vnodeAuth, async (req,res)=>{
   try{
@@ -3933,14 +3999,24 @@ app.post(VNODE_ROUTE + '/api/send', vnodeAuth, async (req,res)=>{
     if(!message) return res.status(400).json({ok:false,error:'Mensaje vacío'});
     if(Buffer.byteLength(message,'utf8')>220) return res.status(400).json({ok:false,error:'Mensaje demasiado largo (máx. 220 bytes UTF-8)'});
     const entry=await publishVnode(destination,Portnums.PortNum.TEXT_MESSAGE_APP,Buffer.from(message,'utf8'));
-    res.json({ok:true,...entry,nodeId:VNODE_HEX});
+    const tracker=startVnodeTracker(entry,message);
+    res.json({ok:true,...entry,nodeId:VNODE_HEX,tracker:serializeVnodeTracker(tracker)});
   }catch(err){res.status(502).json({ok:false,error:err?.message||String(err)});}
 });
+app.get(VNODE_ROUTE + '/api/tx-tracker', vnodeAuth, (req,res)=>{
+  pruneVnodeTracker();
+  const packetId = req.query.packetId ? (Number(req.query.packetId)>>>0) : null;
+  let rows=Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt));
+  if(packetId!==null) rows=rows.filter(t=>t.packetId===packetId);
+  res.json({ok:true,nodeId:VNODE_HEX,windowMinutes:10,count:rows.length,tracker:rows.slice(0,50).map(serializeVnodeTracker)});
+});
+
 app.post(VNODE_ROUTE + '/api/announce', vnodeAuth, async (req,res)=>{
   try{
     const destination=String(req.body?.destination||'PR').toUpperCase();
     const entry=await publishVnode(destination,Portnums.PortNum.NODEINFO_APP,vnodeUserPayload());
-    res.json({ok:true,...entry,nodeId:VNODE_HEX});
+    const tracker=startVnodeTracker(entry,null);
+    res.json({ok:true,...entry,nodeId:VNODE_HEX,tracker:serializeVnodeTracker(tracker)});
   }catch(err){res.status(502).json({ok:false,error:err?.message||String(err)});}
 });
 
