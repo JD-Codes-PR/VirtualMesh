@@ -350,6 +350,64 @@ function observeVnodeTargetActivity(result, topic, source=null) {
   }
 }
 
+
+// ======================================================
+// VIRTUAL NODE v1.1.3 - GATEWAY INSPECTOR PR
+// Builds an in-memory Node -> Gateway map from packets observed on PR.
+// This identifies MQTT uplink paths. It does NOT claim MQTT downlink or RF reception.
+// ======================================================
+const vnodePrGatewayInspector = new Map();
+const VNODE_GATEWAY_ACTIVITY_LIMIT = 80;
+const VNODE_GATEWAY_SEEN_KEY_LIMIT = 4000;
+
+function observePrGatewayActivity(result, topic, source=null) {
+  if (!result?.meshPacket || String(result.region||'').toUpperCase() !== 'PR') return;
+  const gatewayId = result.gatewayId ? String(result.gatewayId) : null;
+  if (!gatewayId) return;
+  const from = Number(result.from) >>> 0;
+  const fromHex = result.fromHex || nodeIdToHex(from);
+  const now = Date.now();
+  let g = vnodePrGatewayInspector.get(gatewayId);
+  if (!g) {
+    g = { gatewayId, firstSeenAt:new Date(now).toISOString(), lastSeenAt:null, observations:0, uniquePackets:0, nodes:new Set(), ports:new Map(), channels:new Set(), topics:new Set(), sources:new Set(), activity:[], seenKeys:new Set(), seenKeyOrder:[] };
+    vnodePrGatewayInspector.set(gatewayId,g);
+  }
+  g.observations++;
+  g.lastSeenAt = new Date(now).toISOString();
+  if (fromHex) g.nodes.add(fromHex);
+  if (result.channelId) g.channels.add(String(result.channelId));
+  if (topic) g.topics.add(String(topic));
+  if (source) g.sources.add(String(source));
+  const portName = result.portName || (result.portnum != null ? `Port ${result.portnum}` : 'UNKNOWN');
+  g.ports.set(portName,(g.ports.get(portName)||0)+1);
+  const packetId = Number(result.id) >>> 0;
+  const uniqueKey = `${fromHex}:${packetId}:${gatewayId}:${result.portnum ?? ''}:${result.channelId || ''}`;
+  let isUnique = !g.seenKeys.has(uniqueKey);
+  if (isUnique) {
+    g.seenKeys.add(uniqueKey); g.seenKeyOrder.push(uniqueKey); g.uniquePackets++;
+    if (g.seenKeyOrder.length > VNODE_GATEWAY_SEEN_KEY_LIMIT) { const old=g.seenKeyOrder.shift(); g.seenKeys.delete(old); }
+  }
+  g.activity.push({ receivedAt:g.lastSeenAt, from:fromHex, to:result.broadcast?'BROADCAST':(result.toHex||nodeIdToHex(Number(result.to)>>>0)), packetId, gatewayId, channelId:result.channelId||null, portnum:result.portnum??null, portName, hopLimit:result.hopLimit??null, hopStart:result.hopStart??null, topic:topic||null, source:source||null, unique:isUnique });
+  if (g.activity.length > VNODE_GATEWAY_ACTIVITY_LIMIT) g.activity.splice(0,g.activity.length-VNODE_GATEWAY_ACTIVITY_LIMIT);
+}
+
+function vnodePrGatewayRows() {
+  const now=Date.now();
+  const directory=new Map(vnodePrNodes().map(n=>[String(n.nodeHex||'').toLowerCase(),n]));
+  return Array.from(vnodePrGatewayInspector.values()).map(g=>{
+    const meta=directory.get(String(g.gatewayId).toLowerCase()) || null;
+    const ageSeconds=g.lastSeenAt ? Math.max(0,Math.floor((now-Date.parse(g.lastSeenAt))/1000)) : null;
+    return {
+      gatewayId:g.gatewayId, longName:meta?.longName||null, shortName:meta?.shortName||null, hardwareModel:meta?.hardwareModel??null, role:meta?.role??null,
+      firstSeenAt:g.firstSeenAt, lastSeenAt:g.lastSeenAt, ageSeconds, observations:g.observations, uniquePackets:g.uniquePackets,
+      nodeCount:g.nodes.size, nodes:Array.from(g.nodes).slice(0,100), channels:Array.from(g.channels), sources:Array.from(g.sources),
+      ports:Array.from(g.ports.entries()).sort((a,b)=>b[1]-a[1]).map(([portName,count])=>({portName,count})),
+      activity:g.activity.slice(-20).reverse(), isVirtualMesh:String(g.gatewayId).toLowerCase()===VNODE_HEX.toLowerCase(),
+      downlinkStatus:'UNKNOWN', note:'Tráfico PR observado entrando a MQTT por este Gateway ID. Esto demuestra uplink observado, no downlink MQTT→LoRa.'
+    };
+  }).sort((a,b)=>(a.ageSeconds??1e15)-(b.ageSeconds??1e15) || b.uniquePackets-a.uniquePackets);
+}
+
 function nextVnodePacketId() {
   vnodePacketCounter = (vnodePacketCounter + 1) >>> 0;
   if (vnodePacketCounter === 0) vnodePacketCounter = 1;
@@ -3048,6 +3106,7 @@ function handleMessage(topic, payload, regionOverride = null, sourceOverride = n
   // Virtual Node TX Tracker: observe our packet if it reappears on any subscribed source.
   observeVnodeTx(result, topic, sourceOverride || region.id);
   observeVnodeTargetActivity(result, topic, sourceOverride || region.id);
+  observePrGatewayActivity(result, topic, sourceOverride || region.id);
 
   // ==================================================
   // SEND TO BROWSER
@@ -4034,7 +4093,7 @@ app.get('/virtual-node.html', (req,res) => res.status(404).send('Not Found'));
 app.get(VNODE_ROUTE + '/api/status', vnodeAuth, (req,res)=>{
   const dests=vnodeDestinations();
   pruneVnodeTracker();
-  res.json({service:'VirtualMesh Virtual Node',version:'v1.1.2',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20),tracker:Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt)).slice(0,20).map(serializeVnodeTracker)});
+  res.json({service:'VirtualMesh Virtual Node',version:'v1.1.3',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20),tracker:Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt)).slice(0,20).map(serializeVnodeTracker)});
 });
 function parseVnodeTarget(value) {
   const raw=String(value||'').trim();
@@ -4065,6 +4124,10 @@ function vnodePrNodes() {
 app.get(VNODE_ROUTE + '/api/pr-nodes', vnodeAuth, (req,res)=>{
   const nodes=vnodePrNodes();
   res.json({ok:true,region:'PR',count:nodes.length,selectable:nodes.filter(n=>n.selectable).length,nodes});
+});
+app.get(VNODE_ROUTE + '/api/gateway-inspector', vnodeAuth, (req,res)=>{
+  const gateways=vnodePrGatewayRows();
+  res.json({ok:true,region:'PR',generatedAt:new Date().toISOString(),count:gateways.length,gateways});
 });
 app.post(VNODE_ROUTE + '/api/send-directed', vnodeAuth, async (req,res)=>{
   try{
