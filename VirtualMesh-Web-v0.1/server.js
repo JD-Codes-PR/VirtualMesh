@@ -3345,7 +3345,8 @@ app.get('/api/live-nodes', (req, res) => {
   const liveWindowMs = LIVE_MAX_AGE_SECONDS * 1000;
   let nodes = Array.from(uniqueNodes.values()).filter(node => {
     const t = Date.parse(node.lastSeen || node.updatedAt || node.lastHeard || '');
-    return Number.isFinite(t) && (now - t) <= liveWindowMs && isOperationalGeography(node);
+    const ageMs = now - t;
+    return Number.isFinite(t) && ageMs >= 0 && ageMs <= liveWindowMs && isOperationalGeography(node);
   });
   const country = String(req.query.country || '').trim().toUpperCase();
   const state = String(req.query.state || '').trim().toUpperCase();
@@ -3523,32 +3524,60 @@ app.get('/api/node-directory',(req,res)=>{
   if(q) nodes=nodes.filter(n=>[n.nodeHex,n.longName,n.shortName,n.country,n.subdivision].some(v=>String(v||'').toLowerCase().includes(q)));
   if(status) nodes=nodes.filter(n=>n.temporalStatus===status);
   if(region) nodes=nodes.filter(n=>n.regionsSeen.some(r=>String(r).toUpperCase()===region));
-  res.json({service:'VirtualMesh',version:'v0.7.3',mode:'READ_ONLY',count:nodes.length,nodes});
+  res.json({service:'VirtualMesh',version:'v0.7.4',mode:'READ_ONLY',count:nodes.length,nodes});
 });
 
 app.get('/api/conversations',(req,res)=>{
   const limit=Math.min(Math.max(Number(req.query.limit||50),1),200);
   const rows=conversationRows().slice(0,limit);
-  res.json({service:'VirtualMesh',version:'v0.7.3',mode:'READ_ONLY',count:rows.length,conversations:rows});
+  res.json({service:'VirtualMesh',version:'v0.7.4',mode:'READ_ONLY',count:rows.length,conversations:rows});
 });
 
 app.get('/api/network-explorer',(req,res)=>{
   const nodes=nodeDirectoryRows();
   const gateways=topologySummary().slice(0,250);
   const channels=getChannelDiscoveryObject();
-  res.json({service:'VirtualMesh',version:'v0.7.3',mode:'READ_ONLY',summary:{nodes:nodes.length,liveNodes:nodes.filter(n=>n.temporalStatus==='LIVE').length,gateways:gateways.length,channels:channels.length,messages:messageInbox.size},nodes:nodes.slice(0,500),gateways,channels});
+  res.json({service:'VirtualMesh',version:'v0.7.4',mode:'READ_ONLY',summary:{nodes:nodes.length,liveNodes:nodes.filter(n=>n.temporalStatus==='LIVE').length,gateways:gateways.length,channels:channels.length,messages:messageInbox.size},nodes:nodes.slice(0,500),gateways,channels});
 });
 
 app.get('/api/channel-intelligence',(req,res)=>{
   const channels=getChannelDiscoveryObject(); const candidates=getChannelCandidates();
   const byKey=new Map(candidates.map(c=>[`${c.source}|${c.channelId}`,c]));
   const rows=channels.map(c=>({...c,candidate:byKey.get(`${c.source}|${c.channelId}`)?.candidate||null}));
-  res.json({service:'VirtualMesh',version:'v0.7.3',mode:'READ_ONLY',automaticPromotion:false,count:rows.length,channels:rows});
+  res.json({service:'VirtualMesh',version:'v0.7.4',mode:'READ_ONLY',automaticPromotion:false,count:rows.length,channels:rows});
 });
 
 app.get('/api/dashboard',(req,res)=>{
-  const nodes=nodeDirectoryRows(), messages=getMessagesNewestFirst(), channels=getChannelDiscoveryObject();
-  res.json({service:'VirtualMesh',version:'v0.7.3',mode:'READ_ONLY',mqttState,updatedAt:new Date().toISOString(),summary:{knownNodes:nodes.length,liveNodes:nodes.filter(n=>n.temporalStatus==='LIVE').length,messages:messages.length,directed:messages.filter(m=>m.directed).length,pki:messages.filter(m=>m.pki).length,channels:channels.length,gateways:trafficGateways.size},sources:{regions:REGIONS.map(r=>r.id),topics:TOPICS},messageStats:{...messageDedupStats}});
+  const now = Date.now();
+  const liveWindowMs = LIVE_MAX_AGE_SECONDS * 1000;
+  const nodes = nodeDirectoryRows();
+  const liveNodes = Array.from(uniqueNodes.values()).filter(node => {
+    const t = Date.parse(node.lastSeen || node.updatedAt || node.lastHeard || '');
+    if (!Number.isFinite(t)) return false;
+    const ageMs = now - t;
+    return ageMs >= 0 && ageMs <= liveWindowMs && isOperationalGeography(node);
+  });
+  const messages = getMessagesNewestFirst();
+  const channels = channelIntelligenceRows();
+  res.json({
+    service:'VirtualMesh',
+    version:'v0.7.4',
+    mode:'READ_ONLY',
+    mqttState,
+    updatedAt:new Date().toISOString(),
+    liveWindowMinutes: LIVE_MAX_AGE_SECONDS / 60,
+    summary:{
+      knownNodes:nodes.length,
+      liveNodes:liveNodes.length,
+      messages:messages.length,
+      directed:messages.filter(m=>m.directed).length,
+      pki:messages.filter(m=>m.pki).length,
+      channels:channels.length,
+      gateways:trafficGateways.size
+    },
+    sources:{regions:REGIONS.map(r=>r.id),topics:TOPICS},
+    messageStats:{...messageDedupStats}
+  });
 });
 
 // API - DIAGNOSTICS
