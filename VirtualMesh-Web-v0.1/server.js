@@ -274,7 +274,7 @@ function serializeVnodeTracker(t) {
   const st = trackerStatus(t);
   return {
     packetId:t.packetId, destination:t.destination, topic:t.topic, portnum:t.portnum,
-    message:t.message ?? null, publishedAt:t.publishedAt, expiresAt:t.expiresAt,
+    to:t.to || 'BROADCAST', directed:!!t.directed, message:t.message ?? null, publishedAt:t.publishedAt, expiresAt:t.expiresAt,
     observations:t.observations, firstObservedAt:t.firstObservedAt, lastObservedAt:t.lastObservedAt,
     regions:Array.from(t.regions), sources:Array.from(t.sources), topics:Array.from(t.topics),
     ...st,
@@ -289,7 +289,7 @@ function startVnodeTracker(entry, message=null) {
   const published=Date.parse(entry.at) || Date.now();
   const t={
     packetId:entry.packetId >>> 0, destination:entry.destination, topic:entry.topic,
-    portnum:entry.portnum, message, publishedAt:new Date(published).toISOString(),
+    portnum:entry.portnum, to:entry.to || 'BROADCAST', directed:!!entry.directed, message, publishedAt:new Date(published).toISOString(),
     expiresAt:published+VNODE_TRACK_TTL_MS, observations:0, firstObservedAt:null,lastObservedAt:null,
     gateways:new Set(),regions:new Set(),sources:new Set(),topics:new Set()
   };
@@ -340,28 +340,28 @@ function vnodeDestinations() {
     COLOMBIA: { label:'Colombia', client:colombiaSource?.client, topicRoot:'msh/CO', channel:'LongFast', key:LONGFAST_KEY }
   };
 }
-function buildVnodeEnvelope(portnum, appPayload, channelName='LongFast', key=LONGFAST_KEY) {
+function buildVnodeEnvelope(portnum, appPayload, channelName='LongFast', key=LONGFAST_KEY, toNode=0xffffffff) {
   const packetId = nextVnodePacketId();
   const data = create(Mesh.DataSchema, { portnum, payload: Buffer.from(appPayload), wantResponse:false, requestId:0, replyId:0 });
   const plain = toBinary(Mesh.DataSchema, data);
   const encrypted = encryptVnodeData(plain, packetId, VNODE_ID, key);
   const packet = create(Mesh.MeshPacketSchema, {
-    from: VNODE_ID, to: 0xffffffff, channel: 0, id: packetId,
+    from: VNODE_ID, to: toNode >>> 0, channel: 0, id: packetId,
     hopLimit: 3, hopStart: 3, viaMqtt: true,
     payloadVariant: { case:'encrypted', value:encrypted }
   });
   const envelope = create(Mqtt.ServiceEnvelopeSchema, { packet, channelId:channelName, gatewayId:VNODE_HEX });
   return { packetId, bytes:Buffer.from(toBinary(Mqtt.ServiceEnvelopeSchema,envelope)) };
 }
-function publishVnode(destinationKey, portnum, payload) {
+function publishVnode(destinationKey, portnum, payload, toNode=0xffffffff) {
   if (!VNODE_TX_CONFIGURED) return Promise.reject(new Error('Configura VNODE_ID_SEED en Render antes de transmitir'));
   const d = vnodeDestinations()[destinationKey];
   if (!d) return Promise.reject(new Error('Destino no permitido'));
   if (!d.client?.connected) return Promise.reject(new Error(`Broker ${d.label} no conectado`));
-  const built = buildVnodeEnvelope(portnum,payload,d.channel,d.key);
+  const built = buildVnodeEnvelope(portnum,payload,d.channel,d.key,toNode);
   const topic = `${d.topicRoot}/2/e/${d.channel}/${VNODE_HEX}`;
   return new Promise((resolve,reject)=>d.client.publish(topic,built.bytes,{qos:0,retain:false},err=>{
-    const entry={at:new Date().toISOString(),destination:destinationKey,topic,packetId:built.packetId,portnum,ok:!err,error:err?.message||null};
+    const entry={at:new Date().toISOString(),destination:destinationKey,topic,packetId:built.packetId,portnum,to:toNode===0xffffffff?'BROADCAST':nodeIdToHex(toNode),directed:toNode!==0xffffffff,ok:!err,error:err?.message||null};
     vnodeTxLog.unshift(entry); if(vnodeTxLog.length>50)vnodeTxLog.length=50;
     if(err) reject(err); else resolve(entry);
   }));
@@ -3990,7 +3990,53 @@ app.get('/virtual-node.html', (req,res) => res.status(404).send('Not Found'));
 app.get(VNODE_ROUTE + '/api/status', vnodeAuth, (req,res)=>{
   const dests=vnodeDestinations();
   pruneVnodeTracker();
-  res.json({service:'VirtualMesh Virtual Node',version:'v1.1.0',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20),tracker:Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt)).slice(0,20).map(serializeVnodeTracker)});
+  res.json({service:'VirtualMesh Virtual Node',version:'v1.1.1',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20),tracker:Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt)).slice(0,20).map(serializeVnodeTracker)});
+});
+function parseVnodeTarget(value) {
+  const raw=String(value||'').trim();
+  if(!raw) return null;
+  const hex=raw.replace(/^!/, '');
+  if(/^[0-9a-fA-F]{8}$/.test(hex)) return parseInt(hex,16)>>>0;
+  if(/^\d+$/.test(raw)) { const n=Number(raw); if(Number.isSafeInteger(n)&&n>=0&&n<=0xffffffff) return n>>>0; }
+  return null;
+}
+function vnodePrNodes() {
+  const now=Date.now();
+  return nodeDirectoryRows().filter(n=>n.regionsSeen?.some(r=>String(r).toUpperCase()==='PR')).map(n=>{
+    const numeric=parseVnodeTarget(n.nodeHex||n.nodeId);
+    const raw= numeric!==null ? uniqueNodes.get(numeric) : null;
+    const gateways=new Set();
+    for(const m of getMessagesNewestFirst()) {
+      if((Number(m.from)>>>0)===(numeric>>>0) && String(m.region||m.source||'').toUpperCase()==='PR') {
+        for(const g of (m.gateways||[])) gateways.add(String(g));
+        if(m.gatewayId) gateways.add(String(m.gatewayId));
+      }
+    }
+    let publicKeyKnown=!!n.hasPublicKey;
+    if(raw?.publicKey) publicKeyKnown=true;
+    return {...n, publicKeyKnown, gateways:Array.from(gateways).slice(0,12), isVirtualMesh:n.nodeHex===VNODE_HEX,
+      ageSeconds:n.ageSeconds, selectable:n.nodeHex!==VNODE_HEX && ['LIVE','RECENT'].includes(n.temporalStatus)};
+  }).sort((a,b)=>(a.ageSeconds??1e15)-(b.ageSeconds??1e15));
+}
+app.get(VNODE_ROUTE + '/api/pr-nodes', vnodeAuth, (req,res)=>{
+  const nodes=vnodePrNodes();
+  res.json({ok:true,region:'PR',count:nodes.length,selectable:nodes.filter(n=>n.selectable).length,nodes});
+});
+app.post(VNODE_ROUTE + '/api/send-directed', vnodeAuth, async (req,res)=>{
+  try{
+    const destination='PR';
+    const toNode=parseVnodeTarget(req.body?.to);
+    const message=String(req.body?.message||'').trim();
+    if(toNode===null || toNode===0xffffffff) return res.status(400).json({ok:false,error:'Node ID destino inválido'});
+    if(toNode===(VNODE_ID>>>0)) return res.status(400).json({ok:false,error:'El destino no puede ser VirtualMesh'});
+    if(!message) return res.status(400).json({ok:false,error:'Mensaje vacío'});
+    if(Buffer.byteLength(message,'utf8')>220) return res.status(400).json({ok:false,error:'Mensaje demasiado largo (máx. 220 bytes UTF-8)'});
+    const known=vnodePrNodes().find(n=>parseVnodeTarget(n.nodeHex)===(toNode>>>0));
+    if(!known) return res.status(400).json({ok:false,error:'El Node ID no está en el directorio observado de Puerto Rico'});
+    const entry=await publishVnode(destination,Portnums.PortNum.TEXT_MESSAGE_APP,Buffer.from(message,'utf8'),toNode);
+    const tracker=startVnodeTracker(entry,message);
+    res.json({ok:true,...entry,nodeId:VNODE_HEX,target:{nodeHex:known.nodeHex,longName:known.longName,shortName:known.shortName,publicKeyKnown:known.publicKeyKnown,lastSeen:known.lastSeen},tracker:serializeVnodeTracker(tracker)});
+  }catch(err){res.status(502).json({ok:false,error:err?.message||String(err)});}
 });
 app.post(VNODE_ROUTE + '/api/send', vnodeAuth, async (req,res)=>{
   try{
