@@ -2014,6 +2014,7 @@ console.log('Public key capture: ENABLED');
 console.log('Traffic analyzer:', TRAFFIC_ANALYZER ? 'ENABLED (diagnostic, no blocking)' : 'DISABLED');
 console.log('Per-packet log:', VERBOSE ? 'VERBOSE' : 'QUIET (interesting only + 60s summary)');
 console.log('MQTT publish: DISABLED');
+  console.log('Experience Layer v0.7.3: dashboard | nodes | conversations | network | channels');
 console.log('===================================');
 
 // ======================================================
@@ -3469,6 +3470,87 @@ app.get('/api/public/pr/nodes',(req,res)=>{const nodes=publicPrNodes();res.json(
 app.get('/api/public/pr/messages',(req,res)=>{const limit=Math.min(Math.max(Number(req.query.limit||100),1),250),messages=publicPrMessages().slice(0,limit);res.json({service:'VirtualMesh Puerto Rico',mode:'READ_ONLY',visibility:'PUBLIC_BROADCAST_ONLY',count:messages.length,messages});});
 app.get('/api/public/pr/telemetry',(req,res)=>{const nodes=publicPrNodes().filter(n=>n.telemetry),environment=nodes.filter(n=>n.telemetry.type==='environmentMetrics'),device=nodes.filter(n=>n.telemetry.type==='deviceMetrics'),power=nodes.filter(n=>n.telemetry.type==='powerMetrics');res.json({service:'VirtualMesh Puerto Rico',mode:'READ_ONLY',count:nodes.length,environmentCount:environment.length,deviceCount:device.length,powerCount:power.length,environment,device,power});});
 
+
+
+// ======================================================
+// EXPERIENCE LAYER v0.7.3
+// Five bundled upgrades: Node Directory, Conversations,
+// Network Explorer, Channel Intelligence and Dashboard.
+// READ ONLY: no MQTT publish path is introduced here.
+// ======================================================
+function nodeDirectoryRows() {
+  const now = Date.now();
+  return Array.from(uniqueNodes.values()).map(node => {
+    const seen = Date.parse(node.lastSeen || node.updatedAt || node.lastHeard || '');
+    const ageSeconds = Number.isFinite(seen) ? Math.max(0, Math.floor((now-seen)/1000)) : null;
+    const identity = nodeIdentityForMessage(node.nodeId);
+    return {
+      nodeId: node.nodeId, nodeHex: node.nodeHex,
+      longName: identity?.longName || null, shortName: identity?.shortName || null,
+      identitySource: identity?.source || null,
+      regionsSeen: node.regionsSeen || [], lastRegion: node.lastRegion || null,
+      countryCode: node.countryCode || null, country: node.country || null,
+      subdivisionCode: node.subdivisionCode || null, subdivision: node.subdivision || null,
+      lastSeen: node.lastSeen || null, ageSeconds,
+      temporalStatus: ageSeconds === null ? 'UNKNOWN' : ageSeconds <= LIVE_MAX_AGE_SECONDS ? 'LIVE' : ageSeconds <= 86400 ? 'RECENT' : 'STALE',
+      hasPosition: !!(node.position || node.mapReport || (node.latitude != null && node.longitude != null)),
+      hasPublicKey: !!node.publicKey,
+      hardwareModel: node.user?.hwModel ?? node.mapReport?.hwModel ?? null,
+      role: node.user?.role ?? node.mapReport?.role ?? null
+    };
+  }).sort((a,b)=>String(b.lastSeen||'').localeCompare(String(a.lastSeen||'')));
+}
+
+function conversationRows() {
+  const groups = new Map();
+  for (const m of getMessagesNewestFirst()) {
+    const directed = !!m.directed;
+    const a = nodeIdToHex(m.from), b = m.to === 0xffffffff ? 'BROADCAST' : nodeIdToHex(m.to);
+    const pair = directed ? [a,b].sort().join('↔') : null;
+    const key = directed ? `DIRECT:${pair}:${m.channelId||'?'}` : `CHANNEL:${m.source||m.region||'?'}:${m.channelId||'?'}`;
+    const g = groups.get(key) || { key, type: directed ? 'DIRECT' : 'CHANNEL', channelId:m.channelId||null, source:m.source||m.region||null, participants:new Set(), messages:[], lastSeen:null };
+    g.participants.add(a); if (directed) g.participants.add(b);
+    g.messages.push({...m, ...messageIdentityFields(m.from,m.to), channelClassification:classifyMessageChannel(m)});
+    if (!g.lastSeen || String(m.lastSeen||'') > g.lastSeen) g.lastSeen=m.lastSeen||m.firstSeen||null;
+    groups.set(key,g);
+  }
+  return Array.from(groups.values()).map(g=>({...g,participants:Array.from(g.participants),count:g.messages.length,messages:g.messages.slice(0,100)})).sort((a,b)=>String(b.lastSeen||'').localeCompare(String(a.lastSeen||'')));
+}
+
+app.get('/api/node-directory',(req,res)=>{
+  const q=String(req.query.q||'').trim().toLowerCase(), status=String(req.query.status||'').toUpperCase(), region=String(req.query.region||'').toUpperCase();
+  let nodes=nodeDirectoryRows();
+  if(q) nodes=nodes.filter(n=>[n.nodeHex,n.longName,n.shortName,n.country,n.subdivision].some(v=>String(v||'').toLowerCase().includes(q)));
+  if(status) nodes=nodes.filter(n=>n.temporalStatus===status);
+  if(region) nodes=nodes.filter(n=>n.regionsSeen.some(r=>String(r).toUpperCase()===region));
+  res.json({service:'VirtualMesh',version:'v0.7.3',mode:'READ_ONLY',count:nodes.length,nodes});
+});
+
+app.get('/api/conversations',(req,res)=>{
+  const limit=Math.min(Math.max(Number(req.query.limit||50),1),200);
+  const rows=conversationRows().slice(0,limit);
+  res.json({service:'VirtualMesh',version:'v0.7.3',mode:'READ_ONLY',count:rows.length,conversations:rows});
+});
+
+app.get('/api/network-explorer',(req,res)=>{
+  const nodes=nodeDirectoryRows();
+  const gateways=topologySummary().slice(0,250);
+  const channels=getChannelDiscoveryObject();
+  res.json({service:'VirtualMesh',version:'v0.7.3',mode:'READ_ONLY',summary:{nodes:nodes.length,liveNodes:nodes.filter(n=>n.temporalStatus==='LIVE').length,gateways:gateways.length,channels:channels.length,messages:messageInbox.size},nodes:nodes.slice(0,500),gateways,channels});
+});
+
+app.get('/api/channel-intelligence',(req,res)=>{
+  const channels=getChannelDiscoveryObject(); const candidates=getChannelCandidates();
+  const byKey=new Map(candidates.map(c=>[`${c.source}|${c.channelId}`,c]));
+  const rows=channels.map(c=>({...c,candidate:byKey.get(`${c.source}|${c.channelId}`)?.candidate||null}));
+  res.json({service:'VirtualMesh',version:'v0.7.3',mode:'READ_ONLY',automaticPromotion:false,count:rows.length,channels:rows});
+});
+
+app.get('/api/dashboard',(req,res)=>{
+  const nodes=nodeDirectoryRows(), messages=getMessagesNewestFirst(), channels=getChannelDiscoveryObject();
+  res.json({service:'VirtualMesh',version:'v0.7.3',mode:'READ_ONLY',mqttState,updatedAt:new Date().toISOString(),summary:{knownNodes:nodes.length,liveNodes:nodes.filter(n=>n.temporalStatus==='LIVE').length,messages:messages.length,directed:messages.filter(m=>m.directed).length,pki:messages.filter(m=>m.pki).length,channels:channels.length,gateways:trafficGateways.size},sources:{regions:REGIONS.map(r=>r.id),topics:TOPICS},messageStats:{...messageDedupStats}});
+});
+
 // API - DIAGNOSTICS
 // ======================================================
 
@@ -3619,7 +3701,8 @@ app.get('/api/status', (req, res) => {
 
   res.json({
     service: 'VirtualMesh',
-    operationalCore: 'v0.5.5-latam',
+    operationalCore: 'v0.7.3',
+    experienceLayer: 'v0.7.3',
     mqttState,
     topics: TOPICS,
     regions: REGIONS,
@@ -3684,6 +3767,7 @@ server.listen(PORT, () => {
   console.log('MAP_REPORT_APP: DECODE');
   console.log('Public keys: CAPTURE');
   console.log('MQTT publish: DISABLED');
+  console.log('Experience Layer v0.7.3: dashboard | nodes | conversations | network | channels');
   console.log('Diagnostics endpoint: /api/diagnostics');
   console.log('Traffic analyzer endpoint: /api/traffic-analyzer');
   console.log('Channel candidate analyzer v2: /api/channel-candidates');
