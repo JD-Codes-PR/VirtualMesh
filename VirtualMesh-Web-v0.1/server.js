@@ -789,14 +789,23 @@ function getMqttTopicType(topic) {
 // NODE ID
 // ======================================================
 
-function nodeIdToHex(nodeId) {
+function parseNodeNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? (value >>> 0) : null;
+  if (typeof value === 'bigint') return Number(value & 0xffffffffn) >>> 0;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  let n;
+  if (/^![0-9a-f]{1,8}$/i.test(raw)) n = Number.parseInt(raw.slice(1), 16);
+  else if (/^0x[0-9a-f]{1,8}$/i.test(raw)) n = Number.parseInt(raw.slice(2), 16);
+  else if (/^[0-9]+$/.test(raw)) n = Number(raw);
+  else return null;
+  return Number.isFinite(n) ? (n >>> 0) : null;
+}
 
-  return (
-    '!' +
-    Number(nodeId)
-      .toString(16)
-      .padStart(8, '0')
-  );
+function nodeIdToHex(nodeId) {
+  const n = parseNodeNumber(nodeId);
+  return n === null ? 'UNKNOWN' : '!' + n.toString(16).padStart(8, '0');
 }
 
 // ======================================================
@@ -940,8 +949,29 @@ function addDecryptAttempt(channelId, success) {
 // ======================================================
 
 function normalizeNodeNumber(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? (n >>> 0) : 0;
+  const n = parseNodeNumber(value);
+  return n === null ? 0 : n;
+}
+
+function validNodeNumber(value) {
+  return parseNodeNumber(value);
+}
+
+function findEquivalentMessage({ regionId, channelId, from, text, receivedAt }) {
+  const f = validNodeNumber(from);
+  const t = Date.parse(receivedAt || '') || Date.now();
+  const ch = String(channelId || '').toUpperCase();
+  const body = String(text || '');
+  for (const item of Array.from(messageInbox.values()).reverse()) {
+    if (String(item.channelId || '').toUpperCase() !== ch) continue;
+    if (String(item.text || '') !== body) continue;
+    if (regionId && !item.regionsSeen?.includes(regionId)) continue;
+    const age = Math.abs(t - (Date.parse(item.lastSeen || item.firstSeen || '') || 0));
+    if (age > 15000) continue;
+    const existingFrom = validNodeNumber(item.from);
+    if (f === null || existingFrom === null || f === 0 || existingFrom === 0) return item;
+  }
+  return null;
 }
 
 function messageIdentity(from, packetId, text, to) {
@@ -1013,11 +1043,25 @@ function recordMessageObservation({
   if (transport === 'json') messageDedupStats.json++;
   if (pki && transport === 'json') messageDedupStats.pkiJson++;
 
-  const key = messageIdentity(from, packetId, text, to);
-  const existing = messageInbox.get(key);
+  const parsedFrom = validNodeNumber(from);
+  const parsedTo = validNodeNumber(to);
+  const normalizedTo = parsedTo === null ? (pki ? 0 : 0xffffffff) : parsedTo;
+  const normalizedFrom = parsedFrom === null ? 0 : parsedFrom;
+  const key = messageIdentity(normalizedFrom, packetId, text, normalizedTo);
+  const existing = messageInbox.get(key) || findEquivalentMessage({
+    regionId, channelId, from: normalizedFrom, text, receivedAt
+  });
   const gateway = gatewayId || null;
 
   if (existing) {
+    if ((!existing.from || existing.fromHex === 'UNKNOWN') && normalizedFrom) {
+      existing.from = normalizedFrom;
+      existing.fromHex = nodeIdToHex(normalizedFrom);
+    }
+    if ((!existing.to || existing.toHex === 'UNKNOWN') && normalizedTo) {
+      existing.to = normalizedTo;
+      existing.toHex = normalizedTo === 0xffffffff ? 'BROADCAST' : nodeIdToHex(normalizedTo);
+    }
     messageDedupStats.duplicates++;
     existing.lastSeen = receivedAt;
     existing.mqttCopies++;
@@ -1036,14 +1080,14 @@ function recordMessageObservation({
     return { isNew: false, message: existing };
   }
 
-  const isDirected = directed ?? (normalizeNodeNumber(to) !== 0xffffffff);
+  const isDirected = directed ?? (normalizedTo !== 0xffffffff);
   const item = {
     key,
     packetId: normalizeNodeNumber(packetId),
-    from: normalizeNodeNumber(from),
-    fromHex: nodeIdToHex(from),
-    to: normalizeNodeNumber(to),
-    toHex: normalizeNodeNumber(to) === 0xffffffff ? 'BROADCAST' : nodeIdToHex(to),
+    from: normalizedFrom,
+    fromHex: nodeIdToHex(normalizedFrom),
+    to: normalizedTo,
+    toHex: normalizedTo === 0xffffffff ? 'BROADCAST' : nodeIdToHex(normalizedTo),
     directed: !!isDirected,
     broadcast: !isDirected,
     pki: !!pki,
@@ -1793,7 +1837,11 @@ function inspectJsonPacket(region, topic, payload) {
       const jsonChannel = topicParts.length >= 5 ? topicParts[4] : null;
       const jsonGateway = obj.sender || (topicParts.length >= 6 ? topicParts[5] : null);
       const isPkiJson = String(jsonChannel || '').toUpperCase() === 'PKI';
-      const jsonDirected = normalizeNodeNumber(obj.to) !== 0xffffffff;
+      const parsedJsonTo = validNodeNumber(obj.to);
+      // Missing `to` in a broker JSON copy is not evidence of a direct message.
+      // Default to BROADCAST unless the channel itself is PKI.
+      const jsonTo = parsedJsonTo === null ? (isPkiJson ? 0 : 0xffffffff) : parsedJsonTo;
+      const jsonDirected = isPkiJson || jsonTo !== 0xffffffff;
 
       if (jsonText) {
         const recorded = recordMessageObservation({
@@ -1803,7 +1851,7 @@ function inspectJsonPacket(region, topic, payload) {
           topic,
           channelId: jsonChannel,
           from: obj.from,
-          to: obj.to,
+          to: jsonTo,
           packetId: obj.id,
           text: jsonText,
           gatewayId: jsonGateway,
