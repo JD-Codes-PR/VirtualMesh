@@ -200,7 +200,15 @@ const VNODE_ROUTE = (() => {
   if (!/^\/[A-Za-z0-9._~-]+(?:\/[A-Za-z0-9._~-]+)*$/.test(r)) return '/vm-jd-control';
   return r;
 })();
-const VNODE_PANEL_HTML = readFileSync(new URL('./private/virtual-node.html', import.meta.url), 'utf8');
+let VNODE_PANEL_HTML = null;
+let VNODE_PANEL_ERROR = null;
+try {
+  // v1.0.2 canonical layout: virtual-node.html beside server.js.
+  VNODE_PANEL_HTML = readFileSync(new URL('./virtual-node.html', import.meta.url), 'utf8');
+} catch (err) {
+  // Never crash the whole VirtualMesh service because the private panel file is missing.
+  VNODE_PANEL_ERROR = err?.message || String(err);
+}
 const VNODE_TOKEN = process.env.VNODE_TOKEN || '';
 const VNODE_ID_SEED = String(process.env.VNODE_ID_SEED || '');
 const VNODE_TX_CONFIGURED = VNODE_ID_SEED.length >= 24;
@@ -3907,13 +3915,16 @@ app.get('/api/status', (req, res) => {
 // ======================================================
 app.get([VNODE_ROUTE, VNODE_ROUTE + '/'], (req,res) => {
   res.set('Cache-Control','no-store');
+  if (!VNODE_PANEL_HTML) {
+    return res.status(503).type('text').send('Virtual Node panel unavailable. Check server deployment files.');
+  }
   res.type('html').send(VNODE_PANEL_HTML);
 });
 // Deliberately do not expose the obvious filename.
 app.get('/virtual-node.html', (req,res) => res.status(404).send('Not Found'));
 app.get(VNODE_ROUTE + '/api/status', vnodeAuth, (req,res)=>{
   const dests=vnodeDestinations();
-  res.json({service:'VirtualMesh Virtual Node',version:'v1.0.1',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20)});
+  res.json({service:'VirtualMesh Virtual Node',version:'v1.0.2',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20)});
 });
 app.post(VNODE_ROUTE + '/api/send', vnodeAuth, async (req,res)=>{
   try{
@@ -3938,6 +3949,8 @@ server.listen(PORT, () => {
   console.log(`VirtualMesh Web listening on ${PORT}`);
   console.log(`Virtual Node private route: ${VNODE_ROUTE}`);
   console.log(`Virtual Node TX configured: ${VNODE_TX_CONFIGURED ? 'YES' : 'NO'}`);
+  console.log(`Virtual Node panel: ${VNODE_PANEL_HTML ? 'READY' : 'MISSING'}`);
+  if (VNODE_PANEL_ERROR) console.warn(`Virtual Node panel warning: ${VNODE_PANEL_ERROR}`);
   console.log('MQTT mode: READ ONLY');
   console.log('Traffic mode: DIAGNOSTIC TRY ALL');
   console.log('Listening regions:', TOPICS.join(', '));
