@@ -1027,6 +1027,30 @@ function nodeGeographyForMessage(from) {
   };
 }
 
+// ======================================================
+// NODE IDENTITY v0.6.8
+// Names come only from NODEINFO_APP / MAP_REPORT already observed by VirtualMesh.
+// ======================================================
+function nodeIdentityForMessage(nodeId) {
+  const n = parseNodeNumber(nodeId);
+  if (n === null || n === 0 || n === 0xffffffff) return null;
+  const nodeHex = nodeIdToHex(n);
+  const node = uniqueNodes.get(nodeHex);
+  if (!node) return null;
+  const user = node.user || {};
+  const map = node.mapReport || {};
+  const longName = user.longName || map.longName || null;
+  const shortName = user.shortName || map.shortName || null;
+  if (!longName && !shortName) return null;
+  return { nodeHex, longName, shortName, source: (user.longName || user.shortName) ? 'NODEINFO_APP' : 'MAP_REPORT_APP' };
+}
+function messageIdentityFields(from, to) {
+  return {
+    fromIdentity: nodeIdentityForMessage(from),
+    toIdentity: parseNodeNumber(to) === 0xffffffff ? null : nodeIdentityForMessage(to)
+  };
+}
+
 function recordMessageObservation({
   regionId, source, transport, topic, channelId, from, to, packetId,
   text, gatewayId, directed, pki = false, receivedAt = new Date().toISOString()
@@ -3274,6 +3298,7 @@ app.get('/api/messages', (req, res) => {
   let messages = getMessagesNewestFirst().map(m => ({
     ...m,
     ...(nodeGeographyForMessage(m.from) || {}),
+    ...messageIdentityFields(m.from, m.to),
     channelClassification: classifyMessageChannel(m)
   }));
   if (directed === 'true') messages = messages.filter(m => m.directed);
