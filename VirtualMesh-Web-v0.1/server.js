@@ -255,6 +255,30 @@ const vnodeTxLog = [];
 const VNODE_TRACK_TTL_MS = 10 * 60 * 1000;
 const vnodeTxTracker = new Map();
 const VNODE_TARGET_OBS_LIMIT = 60;
+const VNODE_PACKET_SAMPLE_LIMIT = 500;
+const vnodePacketSamples = new Map();
+const vnodePacketSampleOrder = [];
+
+function packetSampleKey(from, packetId) { return `${String(from).toLowerCase()}:${Number(packetId)>>>0}`; }
+function rememberPacketSample(result, topic, source=null) {
+  if (!result?.meshPacket || String(result.region||'').toUpperCase() !== 'PR') return;
+  const key = packetSampleKey(result.fromHex || nodeIdToHex(Number(result.from)>>>0), result.id);
+  const now = new Date().toISOString();
+  let x = vnodePacketSamples.get(key);
+  if (!x) {
+    x = { key, firstSeenAt:now, lastSeenAt:now, observations:0, gateways:new Set(), topics:new Set(), sources:new Set(),
+      from:result.fromHex||nodeIdToHex(Number(result.from)>>>0), to:result.broadcast?'BROADCAST':(result.toHex||nodeIdToHex(Number(result.to)>>>0)),
+      packetId:Number(result.id)>>>0, channelId:result.channelId||null, region:result.region||null, portnum:result.portnum??null, portName:result.portName||null,
+      technical:result.technical||null };
+    vnodePacketSamples.set(key,x); vnodePacketSampleOrder.push(key);
+  }
+  x.lastSeenAt=now; x.observations++;
+  if(result.gatewayId)x.gateways.add(String(result.gatewayId)); if(topic)x.topics.add(String(topic)); if(source)x.sources.add(String(source));
+  if(result.technical)x.technical=result.technical;
+  while(vnodePacketSampleOrder.length>VNODE_PACKET_SAMPLE_LIMIT){const old=vnodePacketSampleOrder.shift();vnodePacketSamples.delete(old);}
+}
+function serializePacketSample(x){return x?{...x,gateways:Array.from(x.gateways||[]),topics:Array.from(x.topics||[]),sources:Array.from(x.sources||[])}:null;}
+
 
 function vnodeTrackerKey(packetId) {
   return `${VNODE_ID >>> 0}:${Number(packetId) >>> 0}`;
@@ -274,11 +298,12 @@ function trackerStatus(t) {
 function serializeVnodeTracker(t) {
   const st = trackerStatus(t);
   return {
-    packetId:t.packetId, destination:t.destination, topic:t.topic, portnum:t.portnum,
+    packetId:t.packetId, destination:t.destination, topic:t.topic, portnum:t.portnum, technical:t.technical||null,
     to:t.to || 'BROADCAST', directed:!!t.directed, message:t.message ?? null, publishedAt:t.publishedAt, expiresAt:t.expiresAt,
     observations:t.observations, firstObservedAt:t.firstObservedAt, lastObservedAt:t.lastObservedAt,
     regions:Array.from(t.regions), sources:Array.from(t.sources), topics:Array.from(t.topics),
     targetActivityCount:(t.targetObservations||[]).length,
+    targetObservationCount:t.targetObservationCount||0,
     targetGateways:Array.from(t.targetGateways||[]),
     targetObservations:(t.targetObservations||[]).slice(-20).reverse(),
     ...st,
@@ -293,10 +318,10 @@ function startVnodeTracker(entry, message=null) {
   const published=Date.parse(entry.at) || Date.now();
   const t={
     packetId:entry.packetId >>> 0, destination:entry.destination, topic:entry.topic,
-    portnum:entry.portnum, to:entry.to || 'BROADCAST', directed:!!entry.directed, message, publishedAt:new Date(published).toISOString(),
+    portnum:entry.portnum, to:entry.to || 'BROADCAST', directed:!!entry.directed, technical:entry.technical||null, message, publishedAt:new Date(published).toISOString(),
     expiresAt:published+VNODE_TRACK_TTL_MS, observations:0, firstObservedAt:null,lastObservedAt:null,
     gateways:new Set(),regions:new Set(),sources:new Set(),topics:new Set(),
-    targetGateways:new Set(),targetObservations:[]
+    targetGateways:new Set(),targetObservations:[],targetSeen:new Map(),targetObservationCount:0
   };
   vnodeTxTracker.set(vnodeTrackerKey(t.packetId),t); pruneVnodeTracker(); return t;
 }
@@ -345,8 +370,20 @@ function observeVnodeTargetActivity(result, topic, source=null) {
       hopLimit: result.hopLimit ?? null,
       hopStart: result.hopStart ?? null
     };
-    t.targetObservations.push(obs);
-    if (t.targetObservations.length > VNODE_TARGET_OBS_LIMIT) t.targetObservations.splice(0,t.targetObservations.length-VNODE_TARGET_OBS_LIMIT);
+    t.targetObservationCount=(t.targetObservationCount||0)+1;
+    const dedupeKey = `${obs.from}:${obs.packetId}:${obs.portnum ?? ''}:${obs.channelId || ''}`;
+    const prior = t.targetSeen?.get(dedupeKey);
+    if (prior) {
+      prior.observations=(prior.observations||1)+1; prior.lastReceivedAt=receivedAt;
+      if(gatewayId && !prior.gateways.includes(gatewayId)) prior.gateways.push(gatewayId);
+    } else {
+      obs.observations=1; obs.lastReceivedAt=receivedAt; obs.gateways=gatewayId?[gatewayId]:[];
+      t.targetSeen ||= new Map(); t.targetSeen.set(dedupeKey,obs); t.targetObservations.push(obs);
+      if (t.targetObservations.length > VNODE_TARGET_OBS_LIMIT) {
+        const removed=t.targetObservations.splice(0,t.targetObservations.length-VNODE_TARGET_OBS_LIMIT);
+        for(const r of removed)t.targetSeen.delete(`${r.from}:${r.packetId}:${r.portnum ?? ''}:${r.channelId || ''}`);
+      }
+    }
   }
 }
 
@@ -452,7 +489,11 @@ function buildVnodeEnvelope(portnum, appPayload, channelName='LongFast', key=LON
     payloadVariant: { case:'encrypted', value:encrypted }
   });
   const envelope = create(Mqtt.ServiceEnvelopeSchema, { packet, channelId:channelName, gatewayId:VNODE_HEX });
-  return { packetId, bytes:Buffer.from(toBinary(Mqtt.ServiceEnvelopeSchema,envelope)) };
+  return { packetId, bytes:Buffer.from(toBinary(Mqtt.ServiceEnvelopeSchema,envelope)), technical:{
+    from:VNODE_HEX,to:toNode===0xffffffff?'BROADCAST':nodeIdToHex(toNode),packetId,channel:0,channelId:channelName,
+    hopLimit:3,hopStart:3,viaMqtt:true,wantAck:packet.wantAck??false,payloadVariant:'encrypted',encryptedBytes:encrypted.length,decodedBytes:Buffer.byteLength(appPayload),
+    portnum,portName:getPortNumName(portnum),wantResponse:false,requestId:0,replyId:0,gatewayId:VNODE_HEX,rxTime:null,rxSnr:null,rxRssi:null
+  }};
 }
 function publishVnode(destinationKey, portnum, payload, toNode=0xffffffff) {
   if (!VNODE_TX_CONFIGURED) return Promise.reject(new Error('Configura VNODE_ID_SEED en Render antes de transmitir'));
@@ -462,7 +503,7 @@ function publishVnode(destinationKey, portnum, payload, toNode=0xffffffff) {
   const built = buildVnodeEnvelope(portnum,payload,d.channel,d.key,toNode);
   const topic = `${d.topicRoot}/2/e/${d.channel}/${VNODE_HEX}`;
   return new Promise((resolve,reject)=>d.client.publish(topic,built.bytes,{qos:0,retain:false},err=>{
-    const entry={at:new Date().toISOString(),destination:destinationKey,topic,packetId:built.packetId,portnum,to:toNode===0xffffffff?'BROADCAST':nodeIdToHex(toNode),directed:toNode!==0xffffffff,ok:!err,error:err?.message||null};
+    const entry={at:new Date().toISOString(),destination:destinationKey,topic,packetId:built.packetId,portnum,to:toNode===0xffffffff?'BROADCAST':nodeIdToHex(toNode),directed:toNode!==0xffffffff,technical:built.technical,ok:!err,error:err?.message||null};
     vnodeTxLog.unshift(entry); if(vnodeTxLog.length>50)vnodeTxLog.length=50;
     if(err) reject(err); else resolve(entry);
   }));
@@ -2580,6 +2621,9 @@ function handleMessage(topic, payload, regionOverride = null, sourceOverride = n
       let decryptionAttempted = false;
 
       let application = null;
+      let dataWantResponse = null;
+      let dataRequestId = null;
+      let dataReplyId = null;
 
       // ==============================================
       // ALREADY DECODED
@@ -2592,6 +2636,7 @@ function handleMessage(topic, payload, regionOverride = null, sourceOverride = n
         variantStats.decoded++;
 
         const data = variant.value;
+        dataWantResponse = !!data.wantResponse; dataRequestId = Number(data.requestId||0)>>>0; dataReplyId = Number(data.replyId||0)>>>0;
 
         portnum = data.portnum;
         portName = getPortNumName(portnum);
@@ -2690,6 +2735,7 @@ function handleMessage(topic, payload, regionOverride = null, sourceOverride = n
 
           payloadType = 'DECRYPTED';
 
+          dataWantResponse = !!data.wantResponse; dataRequestId = Number(data.requestId||0)>>>0; dataReplyId = Number(data.replyId||0)>>>0;
           portnum = data.portnum;
           portName = getPortNumName(portnum);
 
@@ -3044,6 +3090,14 @@ function handleMessage(topic, payload, regionOverride = null, sourceOverride = n
         decryptionSuccess,
         portnum,
         portName,
+        technical:{
+          from:fromHex, to:isBroadcast?'BROADCAST':toHex, packetId:Number(packet.id)>>>0,
+          channel:Number(packet.channel??0), channelId:envelope.channelId||null,
+          hopLimit:packet.hopLimit??null, hopStart:packet.hopStart??null, viaMqtt:packet.viaMqtt??null, wantAck:packet.wantAck??null,
+          payloadVariant:variant?.case||null, encryptedBytes, decodedBytes, portnum, portName,
+          wantResponse:dataWantResponse, requestId:dataRequestId, replyId:dataReplyId,
+          gatewayId:envelope.gatewayId||null, rxTime:packet.rxTime??null, rxSnr:packet.rxSnr??null, rxRssi:packet.rxRssi??null
+        },
         application,
         observedNode: getObservedNode(region.id, packet.from),
         observedNodeCount: observedNodes.size,
@@ -3107,6 +3161,7 @@ function handleMessage(topic, payload, regionOverride = null, sourceOverride = n
   observeVnodeTx(result, topic, sourceOverride || region.id);
   observeVnodeTargetActivity(result, topic, sourceOverride || region.id);
   observePrGatewayActivity(result, topic, sourceOverride || region.id);
+  rememberPacketSample(result, topic, sourceOverride || region.id);
 
   // ==================================================
   // SEND TO BROWSER
@@ -4093,7 +4148,7 @@ app.get('/virtual-node.html', (req,res) => res.status(404).send('Not Found'));
 app.get(VNODE_ROUTE + '/api/status', vnodeAuth, (req,res)=>{
   const dests=vnodeDestinations();
   pruneVnodeTracker();
-  res.json({service:'VirtualMesh Virtual Node',version:'v1.1.3',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20),tracker:Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt)).slice(0,20).map(serializeVnodeTracker)});
+  res.json({service:'VirtualMesh Virtual Node',version:'v1.1.4',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20),tracker:Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt)).slice(0,20).map(serializeVnodeTracker)});
 });
 function parseVnodeTarget(value) {
   const raw=String(value||'').trim();
@@ -4129,6 +4184,22 @@ app.get(VNODE_ROUTE + '/api/gateway-inspector', vnodeAuth, (req,res)=>{
   const gateways=vnodePrGatewayRows();
   res.json({ok:true,region:'PR',generatedAt:new Date().toISOString(),count:gateways.length,gateways});
 });
+app.get(VNODE_ROUTE + '/api/packet-comparator', vnodeAuth, (req,res)=>{
+  pruneVnodeTracker();
+  const txId=req.query.txPacketId ? (Number(req.query.txPacketId)>>>0) : null;
+  const sampleId=req.query.samplePacketId ? (Number(req.query.samplePacketId)>>>0) : null;
+  const sampleFrom=String(req.query.sampleFrom||'').toLowerCase();
+  let tx=null;
+  if(txId!==null){const t=vnodeTxTracker.get(vnodeTrackerKey(txId)); if(t)tx={packetId:t.packetId,from:VNODE_HEX,to:t.to,technical:t.technical||null};}
+  let sample=null;
+  if(sampleId!==null){
+    if(sampleFrom) sample=serializePacketSample(vnodePacketSamples.get(packetSampleKey(sampleFrom,sampleId)));
+    if(!sample){for(const x of vnodePacketSamples.values())if(x.packetId===sampleId){sample=serializePacketSample(x);break;}}
+  }
+  const recent=Array.from(vnodePacketSamples.values()).filter(x=>x.from.toLowerCase()!==VNODE_HEX.toLowerCase()).sort((a,b)=>Date.parse(b.lastSeenAt)-Date.parse(a.lastSeenAt)).slice(0,100).map(serializePacketSample);
+  res.json({ok:true,generatedAt:new Date().toISOString(),tx,sample,recent});
+});
+
 app.post(VNODE_ROUTE + '/api/send-directed', vnodeAuth, async (req,res)=>{
   try{
     const destination='PR';
