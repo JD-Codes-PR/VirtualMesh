@@ -254,6 +254,7 @@ const vnodeTxLog = [];
 // ======================================================
 const VNODE_TRACK_TTL_MS = 10 * 60 * 1000;
 const vnodeTxTracker = new Map();
+const VNODE_TARGET_OBS_LIMIT = 60;
 
 function vnodeTrackerKey(packetId) {
   return `${VNODE_ID >>> 0}:${Number(packetId) >>> 0}`;
@@ -277,6 +278,9 @@ function serializeVnodeTracker(t) {
     to:t.to || 'BROADCAST', directed:!!t.directed, message:t.message ?? null, publishedAt:t.publishedAt, expiresAt:t.expiresAt,
     observations:t.observations, firstObservedAt:t.firstObservedAt, lastObservedAt:t.lastObservedAt,
     regions:Array.from(t.regions), sources:Array.from(t.sources), topics:Array.from(t.topics),
+    targetActivityCount:(t.targetObservations||[]).length,
+    targetGateways:Array.from(t.targetGateways||[]),
+    targetObservations:(t.targetObservations||[]).slice(-20).reverse(),
     ...st,
     note: st.rfConfirmed ? 'Recepción RF confirmada.' : (st.rfEvidence === 'POSSIBLE' ? 'Otro gateway observó el mismo paquete. Es evidencia de propagación, no prueba definitiva de recepción LoRa.' : 'Publicación MQTT confirmada; todavía no hay evidencia de otro gateway.')
   };
@@ -291,7 +295,8 @@ function startVnodeTracker(entry, message=null) {
     packetId:entry.packetId >>> 0, destination:entry.destination, topic:entry.topic,
     portnum:entry.portnum, to:entry.to || 'BROADCAST', directed:!!entry.directed, message, publishedAt:new Date(published).toISOString(),
     expiresAt:published+VNODE_TRACK_TTL_MS, observations:0, firstObservedAt:null,lastObservedAt:null,
-    gateways:new Set(),regions:new Set(),sources:new Set(),topics:new Set()
+    gateways:new Set(),regions:new Set(),sources:new Set(),topics:new Set(),
+    targetGateways:new Set(),targetObservations:[]
   };
   vnodeTxTracker.set(vnodeTrackerKey(t.packetId),t); pruneVnodeTracker(); return t;
 }
@@ -305,6 +310,44 @@ function observeVnodeTx(result, topic, source=null) {
   if(result.region) t.regions.add(String(result.region));
   if(source) t.sources.add(String(source));
   if(topic) t.topics.add(String(topic));
+}
+
+// Directed Target Watch: while a directed TX is being tracked, capture every
+// packet FROM that target node. This tells us which MQTT gateway(s) are
+// carrying the target's traffic during the same 10-minute investigation window.
+function observeVnodeTargetActivity(result, topic, source=null) {
+  if (!result?.meshPacket) return;
+  const from = Number(result.from) >>> 0;
+  const now = Date.now();
+  const receivedAt = new Date(now).toISOString();
+  for (const t of vnodeTxTracker.values()) {
+    if (!t.directed || now > t.expiresAt) continue;
+    const target = parseVnodeTarget(t.to);
+    if (target === null || (target >>> 0) !== from) continue;
+    // A PR-directed test is intended to study the PR source/root only.
+    if (String(t.destination||'').toUpperCase()==='PR' && String(result.region||'').toUpperCase()!=='PR') continue;
+    const gatewayId = result.gatewayId ? String(result.gatewayId) : null;
+    if (gatewayId) t.targetGateways.add(gatewayId);
+    const obs = {
+      receivedAt,
+      from: result.fromHex || nodeIdToHex(from),
+      to: result.broadcast ? 'BROADCAST' : (result.toHex || nodeIdToHex(Number(result.to)>>>0)),
+      packetId: Number(result.id) >>> 0,
+      gatewayId,
+      gatewayIsTarget: !!gatewayId && gatewayId.toLowerCase()===(result.fromHex || nodeIdToHex(from)).toLowerCase(),
+      region: result.region || null,
+      source: source || null,
+      topic: topic || null,
+      channelId: result.channelId || null,
+      portnum: result.portnum ?? null,
+      portName: result.portName || null,
+      payloadType: result.payloadType || null,
+      hopLimit: result.hopLimit ?? null,
+      hopStart: result.hopStart ?? null
+    };
+    t.targetObservations.push(obs);
+    if (t.targetObservations.length > VNODE_TARGET_OBS_LIMIT) t.targetObservations.splice(0,t.targetObservations.length-VNODE_TARGET_OBS_LIMIT);
+  }
 }
 
 function nextVnodePacketId() {
@@ -3004,6 +3047,7 @@ function handleMessage(topic, payload, regionOverride = null, sourceOverride = n
 
   // Virtual Node TX Tracker: observe our packet if it reappears on any subscribed source.
   observeVnodeTx(result, topic, sourceOverride || region.id);
+  observeVnodeTargetActivity(result, topic, sourceOverride || region.id);
 
   // ==================================================
   // SEND TO BROWSER
@@ -3990,7 +4034,7 @@ app.get('/virtual-node.html', (req,res) => res.status(404).send('Not Found'));
 app.get(VNODE_ROUTE + '/api/status', vnodeAuth, (req,res)=>{
   const dests=vnodeDestinations();
   pruneVnodeTracker();
-  res.json({service:'VirtualMesh Virtual Node',version:'v1.1.1',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20),tracker:Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt)).slice(0,20).map(serializeVnodeTracker)});
+  res.json({service:'VirtualMesh Virtual Node',version:'v1.1.2',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20),tracker:Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt)).slice(0,20).map(serializeVnodeTracker)});
 });
 function parseVnodeTarget(value) {
   const raw=String(value||'').trim();
