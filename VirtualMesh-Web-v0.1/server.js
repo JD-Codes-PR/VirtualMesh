@@ -4229,7 +4229,7 @@ app.get('/virtual-node.html', (req,res) => res.status(404).send('Not Found'));
 app.get(VNODE_ROUTE + '/api/status', vnodeAuth, (req,res)=>{
   const dests=vnodeDestinations();
   pruneVnodeTracker();
-  res.json({service:'VirtualMesh Virtual Node',version:'v1.2.0',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20),tracker:Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt)).slice(0,20).map(serializeVnodeTracker)});
+  res.json({service:'VirtualMesh Virtual Node',version:'v1.2.1',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20),tracker:Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt)).slice(0,20).map(serializeVnodeTracker)});
 });
 function parseVnodeTarget(value) {
   const raw=String(value||'').trim();
@@ -4282,21 +4282,38 @@ app.get(VNODE_ROUTE + '/api/packet-comparator', vnodeAuth, (req,res)=>{
 });
 
 
+function comparablePacketDiagnostics(t) {
+  const all=Array.from(vnodePacketSamples.values());
+  const wantedPort=Number(t?.portnum), wantedDirected=!!t?.directed;
+  const stats={retainedSamples:all.length,textMessageSamples:0,textMessageFromVirtualMesh:0,textMessageOtherNodes:0,textMessageBroadcast:0,textMessageDirected:0,textMessageLongFast:0,textMessagePr:0,equivalentCandidates:0};
+  const candidates=[];
+  for(const x of all){
+    if(Number(x.portnum)!==Number(Portnums.PortNum.TEXT_MESSAGE_APP)) continue;
+    stats.textMessageSamples++;
+    const own=String(x.from||'').toLowerCase()===VNODE_HEX.toLowerCase();
+    if(own){stats.textMessageFromVirtualMesh++;continue}
+    stats.textMessageOtherNodes++;
+    const directed=String(x.to||'').toUpperCase()!=='BROADCAST';
+    directed?stats.textMessageDirected++:stats.textMessageBroadcast++;
+    if(String(x.channelId||'')==='LongFast') stats.textMessageLongFast++;
+    if(String(x.region||x.source||'').toUpperCase()==='PR') stats.textMessagePr++;
+    if(Number(x.portnum)===wantedPort && directed===wantedDirected) candidates.push(x);
+  }
+  candidates.sort((a,b)=>Date.parse(b.lastSeenAt)-Date.parse(a.lastSeenAt));
+  stats.equivalentCandidates=candidates.length;
+  return {stats,candidates};
+}
 function bestComparablePacketSample(t) {
-  if (!t) return null;
-  const wantedPort=Number(t.portnum);
-  const wantedDirected=!!t.directed;
-  const rows=Array.from(vnodePacketSamples.values()).filter(x=>{
-    if(String(x.from||'').toLowerCase()===VNODE_HEX.toLowerCase()) return false;
-    if(Number(x.portnum)!==wantedPort) return false;
-    const sampleDirected=String(x.to||'').toUpperCase()!=='BROADCAST';
-    return sampleDirected===wantedDirected;
-  }).sort((a,b)=>Date.parse(b.lastSeenAt)-Date.parse(a.lastSeenAt));
-  return rows[0] ? serializePacketSample(rows[0]) : null;
+  const d=comparablePacketDiagnostics(t);
+  const preferred=d.candidates.find(x=>String(x.channelId||'')==='LongFast'&&String(x.region||x.source||'').toUpperCase()==='PR');
+  const longFast=d.candidates.find(x=>String(x.channelId||'')==='LongFast');
+  const chosen=preferred||longFast||d.candidates[0]||null;
+  return {sample:chosen?serializePacketSample(chosen):null,diagnostics:d.stats,matchScope:preferred?'PR_LONGFAST':longFast?'LONGFAST_OTHER_REGION':chosen?'OTHER_EQUIVALENT':null};
 }
 function txValidatorReport(t) {
   if (!t) return null;
-  const sample=bestComparablePacketSample(t);
+  const match=bestComparablePacketSample(t);
+  const sample=match.sample;
   const tx=t.technical||{};
   const real=sample?.technical||null;
   const compareFields=['channel','channelId','hopLimit','hopStart','viaMqtt','wantAck','payloadVariant','portnum','portName','wantResponse','requestId','replyId'];
@@ -4317,8 +4334,10 @@ function txValidatorReport(t) {
     mqttLoopback:loop,
     comparableSample:sample ? {
       from:sample.from,to:sample.to,packetId:sample.packetId,portnum:sample.portnum,portName:sample.portName,
-      observations:sample.observations,gateways:sample.gateways,lastSeenAt:sample.lastSeenAt,technical:sample.technical
+      observations:sample.observations,gateways:sample.gateways,lastSeenAt:sample.lastSeenAt,technical:sample.technical,
+      region:sample.region||sample.source||null,channelId:sample.channelId||sample.technical?.channelId||null,matchScope:match.matchScope
     } : null,
+    sampleDiagnostics:match.diagnostics,
     comparison,
     evidence:{
       mqttPublished:true,
