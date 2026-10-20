@@ -306,6 +306,7 @@ function serializeVnodeTracker(t) {
     targetObservationCount:t.targetObservationCount||0,
     targetGateways:Array.from(t.targetGateways||[]),
     targetObservations:(t.targetObservations||[]).slice(-20).reverse(),
+    validation:t.validation||null,
     ...st,
     note: st.rfConfirmed ? 'Recepción RF confirmada.' : (st.rfEvidence === 'POSSIBLE' ? 'Otro gateway observó el mismo paquete. Es evidencia de propagación, no prueba definitiva de recepción LoRa.' : 'Publicación MQTT confirmada; todavía no hay evidencia de otro gateway.')
   };
@@ -318,7 +319,9 @@ function startVnodeTracker(entry, message=null) {
   const published=Date.parse(entry.at) || Date.now();
   const t={
     packetId:entry.packetId >>> 0, destination:entry.destination, topic:entry.topic,
-    portnum:entry.portnum, to:entry.to || 'BROADCAST', directed:!!entry.directed, technical:entry.technical||null, message, publishedAt:new Date(published).toISOString(),
+    portnum:entry.portnum, to:entry.to || 'BROADCAST', directed:!!entry.directed, technical:entry.technical||null,
+    validation:entry.validation ? {...entry.validation, mqttLoopback:{observed:false,pass:false,checks:{},lastObservedAt:null}} : null,
+    message, publishedAt:new Date(published).toISOString(),
     expiresAt:published+VNODE_TRACK_TTL_MS, observations:0, firstObservedAt:null,lastObservedAt:null,
     gateways:new Set(),regions:new Set(),sources:new Set(),topics:new Set(),
     targetGateways:new Set(),targetObservations:[],targetSeen:new Map(),targetObservationCount:0
@@ -335,6 +338,28 @@ function observeVnodeTx(result, topic, source=null) {
   if(result.region) t.regions.add(String(result.region));
   if(source) t.sources.add(String(source));
   if(topic) t.topics.add(String(topic));
+
+  if (t.validation) {
+    const rt = result.technical || {};
+    const checks = {
+      packetId:(Number(result.id)>>>0)===(t.packetId>>>0),
+      from:String(result.fromHex||'').toLowerCase()===VNODE_HEX.toLowerCase(),
+      to:String(result.broadcast?'BROADCAST':(result.toHex||'')).toLowerCase()===String(t.to||'').toLowerCase(),
+      channelId:String(result.channelId||'')===String(t.technical?.channelId||''),
+      portnum:Number(result.portnum)===Number(t.portnum),
+      payloadVariant:String(rt.payloadVariant||'')==='encrypted',
+      encryptedBytes:Number(rt.encryptedBytes)===Number(t.technical?.encryptedBytes),
+      encryptedSha256:!!rt.encryptedSha256 && rt.encryptedSha256===t.technical?.encryptedSha256
+    };
+    t.validation.mqttLoopback = {
+      observed:true,
+      pass:Object.values(checks).every(Boolean),
+      checks,
+      lastObservedAt:iso,
+      observedGatewayId:result.gatewayId||null,
+      observedTopic:topic||null
+    };
+  }
 }
 
 // Directed Target Watch: while a directed TX is being tracked, capture every
@@ -480,8 +505,9 @@ function vnodeDestinations() {
 }
 function buildVnodeEnvelope(portnum, appPayload, channelName='LongFast', key=LONGFAST_KEY, toNode=0xffffffff) {
   const packetId = nextVnodePacketId();
-  const data = create(Mesh.DataSchema, { portnum, payload: Buffer.from(appPayload), wantResponse:false, requestId:0, replyId:0 });
-  const plain = toBinary(Mesh.DataSchema, data);
+  const appBytes = Buffer.from(appPayload);
+  const data = create(Mesh.DataSchema, { portnum, payload: appBytes, wantResponse:false, requestId:0, replyId:0 });
+  const plain = Buffer.from(toBinary(Mesh.DataSchema, data));
   const encrypted = encryptVnodeData(plain, packetId, VNODE_ID, key);
   const packet = create(Mesh.MeshPacketSchema, {
     from: VNODE_ID, to: toNode >>> 0, channel: 0, id: packetId,
@@ -489,11 +515,64 @@ function buildVnodeEnvelope(portnum, appPayload, channelName='LongFast', key=LON
     payloadVariant: { case:'encrypted', value:encrypted }
   });
   const envelope = create(Mqtt.ServiceEnvelopeSchema, { packet, channelId:channelName, gatewayId:VNODE_HEX });
-  return { packetId, bytes:Buffer.from(toBinary(Mqtt.ServiceEnvelopeSchema,envelope)), technical:{
-    from:VNODE_HEX,to:toNode===0xffffffff?'BROADCAST':nodeIdToHex(toNode),packetId,channel:0,channelId:channelName,
-    hopLimit:3,hopStart:3,viaMqtt:true,wantAck:packet.wantAck??false,payloadVariant:'encrypted',encryptedBytes:encrypted.length,decodedBytes:Buffer.byteLength(appPayload),
-    portnum,portName:getPortNumName(portnum),wantResponse:false,requestId:0,replyId:0,gatewayId:VNODE_HEX,rxTime:null,rxSnr:null,rxRssi:null
-  }};
+  const bytes = Buffer.from(toBinary(Mqtt.ServiceEnvelopeSchema,envelope));
+
+  // TX Validator v1: independently parse our serialized bytes, decrypt the
+  // encrypted Data payload, and verify that the application bytes survive
+  // construction exactly. This validates our local encoder; it is not RF proof.
+  const checks = {};
+  let validationError = null;
+  try {
+    const parsedEnvelope = fromBinary(Mqtt.ServiceEnvelopeSchema, bytes);
+    checks.serviceEnvelope = !!parsedEnvelope?.packet;
+    checks.channelId = parsedEnvelope?.channelId === channelName;
+    checks.gatewayId = parsedEnvelope?.gatewayId === VNODE_HEX;
+
+    const parsedPacket = parsedEnvelope.packet;
+    checks.meshPacket = !!parsedPacket;
+    checks.packetId = (Number(parsedPacket?.id)>>>0) === (packetId>>>0);
+    checks.from = (Number(parsedPacket?.from)>>>0) === (VNODE_ID>>>0);
+    checks.to = (Number(parsedPacket?.to)>>>0) === (toNode>>>0);
+    checks.payloadVariant = parsedPacket?.payloadVariant?.case === 'encrypted';
+
+    const cipherBytes = parsedPacket?.payloadVariant?.case === 'encrypted'
+      ? Buffer.from(parsedPacket.payloadVariant.value) : Buffer.alloc(0);
+    const decryptedPlain = encryptVnodeData(cipherBytes, packetId, VNODE_ID, key); // CTR is symmetric
+    const parsedData = fromBinary(Mesh.DataSchema, decryptedPlain);
+    checks.dataProtobuf = !!parsedData;
+    checks.portnum = Number(parsedData?.portnum) === Number(portnum);
+    checks.appPayload = Buffer.from(parsedData?.payload || []).equals(appBytes);
+    checks.wantResponse = parsedData?.wantResponse === false;
+    checks.requestId = Number(parsedData?.requestId || 0) === 0;
+    checks.replyId = Number(parsedData?.replyId || 0) === 0;
+  } catch (err) {
+    validationError = err?.message || String(err);
+  }
+  const localPass = !validationError && Object.values(checks).every(Boolean);
+  const encryptedSha256 = crypto.createHash('sha256').update(encrypted).digest('hex');
+
+  return {
+    packetId,
+    bytes,
+    technical:{
+      from:VNODE_HEX,to:toNode===0xffffffff?'BROADCAST':nodeIdToHex(toNode),packetId,channel:0,channelId:channelName,
+      hopLimit:3,hopStart:3,viaMqtt:true,wantAck:packet.wantAck??false,payloadVariant:'encrypted',
+      encryptedBytes:encrypted.length,encryptedSha256,decodedBytes:appBytes.length,
+      portnum,portName:getPortNumName(portnum),wantResponse:false,requestId:0,replyId:0,
+      gatewayId:VNODE_HEX,rxTime:null,rxSnr:null,rxRssi:null
+    },
+    validation:{
+      version:'TX_VALIDATOR_V1',
+      localPass,
+      validationError,
+      checks,
+      expectedEncryptedSha256:encryptedSha256,
+      expectedChannelId:channelName,
+      expectedGatewayId:VNODE_HEX,
+      expectedPortnum:Number(portnum),
+      expectedAppBytes:appBytes.length
+    }
+  };
 }
 function publishVnode(destinationKey, portnum, payload, toNode=0xffffffff) {
   if (!VNODE_TX_CONFIGURED) return Promise.reject(new Error('Configura VNODE_ID_SEED en Render antes de transmitir'));
@@ -503,7 +582,7 @@ function publishVnode(destinationKey, portnum, payload, toNode=0xffffffff) {
   const built = buildVnodeEnvelope(portnum,payload,d.channel,d.key,toNode);
   const topic = `${d.topicRoot}/2/e/${d.channel}/${VNODE_HEX}`;
   return new Promise((resolve,reject)=>d.client.publish(topic,built.bytes,{qos:0,retain:false},err=>{
-    const entry={at:new Date().toISOString(),destination:destinationKey,topic,packetId:built.packetId,portnum,to:toNode===0xffffffff?'BROADCAST':nodeIdToHex(toNode),directed:toNode!==0xffffffff,technical:built.technical,ok:!err,error:err?.message||null};
+    const entry={at:new Date().toISOString(),destination:destinationKey,topic,packetId:built.packetId,portnum,to:toNode===0xffffffff?'BROADCAST':nodeIdToHex(toNode),directed:toNode!==0xffffffff,technical:built.technical,validation:built.validation,ok:!err,error:err?.message||null};
     vnodeTxLog.unshift(entry); if(vnodeTxLog.length>50)vnodeTxLog.length=50;
     if(err) reject(err); else resolve(entry);
   }));
@@ -3094,7 +3173,9 @@ function handleMessage(topic, payload, regionOverride = null, sourceOverride = n
           from:fromHex, to:isBroadcast?'BROADCAST':toHex, packetId:Number(packet.id)>>>0,
           channel:Number(packet.channel??0), channelId:envelope.channelId||null,
           hopLimit:packet.hopLimit??null, hopStart:packet.hopStart??null, viaMqtt:packet.viaMqtt??null, wantAck:packet.wantAck??null,
-          payloadVariant:variant?.case||null, encryptedBytes, decodedBytes, portnum, portName,
+          payloadVariant:variant?.case||null, encryptedBytes, decodedBytes,
+          encryptedSha256:variant?.case==='encrypted' ? crypto.createHash('sha256').update(Buffer.from(variant.value)).digest('hex') : null,
+          portnum, portName,
           wantResponse:dataWantResponse, requestId:dataRequestId, replyId:dataReplyId,
           gatewayId:envelope.gatewayId||null, rxTime:packet.rxTime??null, rxSnr:packet.rxSnr??null, rxRssi:packet.rxRssi??null
         },
@@ -4148,7 +4229,7 @@ app.get('/virtual-node.html', (req,res) => res.status(404).send('Not Found'));
 app.get(VNODE_ROUTE + '/api/status', vnodeAuth, (req,res)=>{
   const dests=vnodeDestinations();
   pruneVnodeTracker();
-  res.json({service:'VirtualMesh Virtual Node',version:'v1.1.4',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20),tracker:Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt)).slice(0,20).map(serializeVnodeTracker)});
+  res.json({service:'VirtualMesh Virtual Node',version:'v1.2.0',nodeId:VNODE_HEX,longName:VNODE_LONG_NAME,shortName:VNODE_SHORT_NAME,publicKey:VNODE_PUBLIC_KEY.toString('base64'),txConfigured:VNODE_TX_CONFIGURED,destinations:Object.fromEntries(Object.entries(dests).map(([k,d])=>[k,{label:d.label,connected:!!d.client?.connected,channel:d.channel}])),tx:vnodeTxLog.slice(0,20),tracker:Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt)).slice(0,20).map(serializeVnodeTracker)});
 });
 function parseVnodeTarget(value) {
   const raw=String(value||'').trim();
@@ -4198,6 +4279,71 @@ app.get(VNODE_ROUTE + '/api/packet-comparator', vnodeAuth, (req,res)=>{
   }
   const recent=Array.from(vnodePacketSamples.values()).filter(x=>x.from.toLowerCase()!==VNODE_HEX.toLowerCase()).sort((a,b)=>Date.parse(b.lastSeenAt)-Date.parse(a.lastSeenAt)).slice(0,100).map(serializePacketSample);
   res.json({ok:true,generatedAt:new Date().toISOString(),tx,sample,recent});
+});
+
+
+function bestComparablePacketSample(t) {
+  if (!t) return null;
+  const wantedPort=Number(t.portnum);
+  const wantedDirected=!!t.directed;
+  const rows=Array.from(vnodePacketSamples.values()).filter(x=>{
+    if(String(x.from||'').toLowerCase()===VNODE_HEX.toLowerCase()) return false;
+    if(Number(x.portnum)!==wantedPort) return false;
+    const sampleDirected=String(x.to||'').toUpperCase()!=='BROADCAST';
+    return sampleDirected===wantedDirected;
+  }).sort((a,b)=>Date.parse(b.lastSeenAt)-Date.parse(a.lastSeenAt));
+  return rows[0] ? serializePacketSample(rows[0]) : null;
+}
+function txValidatorReport(t) {
+  if (!t) return null;
+  const sample=bestComparablePacketSample(t);
+  const tx=t.technical||{};
+  const real=sample?.technical||null;
+  const compareFields=['channel','channelId','hopLimit','hopStart','viaMqtt','wantAck','payloadVariant','portnum','portName','wantResponse','requestId','replyId'];
+  const comparison=real ? compareFields.map(field=>({field,virtualMesh:tx[field]??null,real:real[field]??null,same:(tx[field]??null)===(real[field]??null)})) : [];
+  const local=t.validation||null;
+  const loop=local?.mqttLoopback||null;
+  let stage='LOCAL_VALIDATION';
+  if(local?.localPass) stage='LOCAL_PASS';
+  if(loop?.observed) stage=loop.pass?'MQTT_LOOPBACK_PASS':'MQTT_LOOPBACK_MISMATCH';
+  const tracker=trackerStatus(t);
+  if(tracker.foreignGateways?.length) stage='EXTERNAL_GATEWAY_OBSERVED';
+  return {
+    version:'TX_VALIDATOR_V1',
+    packetId:t.packetId,
+    generatedAt:new Date().toISOString(),
+    stage,
+    localValidation:local ? {localPass:local.localPass,validationError:local.validationError,checks:local.checks} : null,
+    mqttLoopback:loop,
+    comparableSample:sample ? {
+      from:sample.from,to:sample.to,packetId:sample.packetId,portnum:sample.portnum,portName:sample.portName,
+      observations:sample.observations,gateways:sample.gateways,lastSeenAt:sample.lastSeenAt,technical:sample.technical
+    } : null,
+    comparison,
+    evidence:{
+      mqttPublished:true,
+      mqttLoopbackObserved:!!loop?.observed,
+      mqttLoopbackPass:!!loop?.pass,
+      externalGatewayObserved:(tracker.foreignGateways||[]).length>0,
+      foreignGateways:tracker.foreignGateways||[],
+      rfConfirmed:false
+    },
+    notes:[
+      'PASS local valida serialización, protobuf, cifrado/descifrado y payload dentro de VirtualMesh.',
+      'MQTT LOOPBACK PASS confirma que el paquete observado desde el broker conserva los campos y ciphertext esperados.',
+      'Una diferencia con la muestra real no implica automáticamente un error: hop/viaMqtt y otros campos dependen del origen y contexto.',
+      'RF confirmado permanece NO hasta obtener evidencia independiente de recepción por radio.'
+    ]
+  };
+}
+app.get(VNODE_ROUTE + '/api/tx-validator', vnodeAuth, (req,res)=>{
+  pruneVnodeTracker();
+  const packetId=req.query.packetId ? (Number(req.query.packetId)>>>0) : null;
+  let t=null;
+  if(packetId!==null) t=vnodeTxTracker.get(vnodeTrackerKey(packetId))||null;
+  if(!t) t=Array.from(vnodeTxTracker.values()).sort((a,b)=>Date.parse(b.publishedAt)-Date.parse(a.publishedAt))[0]||null;
+  if(!t) return res.json({ok:true,version:'TX_VALIDATOR_V1',report:null,note:'Aún no hay TX para validar.'});
+  res.json({ok:true,report:txValidatorReport(t)});
 });
 
 app.post(VNODE_ROUTE + '/api/send-directed', vnodeAuth, async (req,res)=>{
@@ -4251,7 +4397,7 @@ server.listen(PORT, () => {
   console.log(`Virtual Node TX configured: ${VNODE_TX_CONFIGURED ? 'YES' : 'NO'}`);
   console.log(`Virtual Node panel: ${VNODE_PANEL_HTML ? 'READY' : 'MISSING'}`);
   if (VNODE_PANEL_ERROR) console.warn(`Virtual Node panel warning: ${VNODE_PANEL_ERROR}`);
-  console.log('MQTT mode: READ ONLY');
+  console.log('MQTT mode: diagnostic RX + controlled Virtual Node TX');
   console.log('Traffic mode: DIAGNOSTIC TRY ALL');
   console.log('Listening regions:', TOPICS.join(', '));
   console.log('/2/e/: TRY SERVICE ENVELOPE');
